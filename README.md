@@ -47,26 +47,26 @@ All TCP frames use a custom **5-byte binary header** (`1 byte type + 4 byte big-
 ```mermaid
 sequenceDiagram
     participant C1 as Client A (JavaFX)
-    participant S  as NioServer (TCP :9090)
+    participant S  as NioServer (TCP 9090)
     participant C2 as Client B (JavaFX)
-    participant MC as UDP Multicast Group<br/>239.255.42.42:9292
+    participant MC as Multicast 239.255.42.42:9292
 
-    Note over C1,S: TCP Handshake & Snapshot
+    Note over C1,S: TCP Handshake and Snapshot
     C1->>S: TCP CONNECT
-    C1->>S: HANDSHAKE [0x01 | len=2 | "{}"]
-    S-->>C1: SNAPSHOT  [0x02 | len=N | JSON shape array]
+    C1->>S: HANDSHAKE [0x01 len=2 payload="{}"]
+    S-->>C1: SNAPSHOT  [0x02 len=N payload=JSON shape array]
 
-    Note over C1,S,C2: Mutation Propagation
-    C1->>S: MUTATION  [0x03 | len=M | {"_type":"Line", ...}]
-    S->>S: applyMutation() — last-writer-wins timestamp check
-    S-->>C2: MUTATION  [0x03 | len=M | {"_type":"Line", ...}]
+    Note over C1,C2: Mutation Propagation
+    C1->>S: MUTATION  [0x03 len=M payload=Line shape object]
+    S->>S: applyMutation() - last-writer-wins timestamp check
+    S-->>C2: MUTATION  [0x03 len=M payload=Line shape object]
     Note right of S: broadcastExcept(sender)
 
-    Note over C1,MC,C2: UDP Cursor Presence (parallel, 50 ms tick)
-    loop every 50 ms (only if pointer moved)
-        C1-)MC: "UDP_POINTER|a1b2c3d4|412.0|308.5"
-        MC-)C2: (same datagram — multicast delivery)
-        C2->>C2: renderCursors() — crosshair overlay + fade timer
+    Note over C1,MC: UDP Cursor Presence - 50 ms tick
+    loop every 50 ms if pointer moved
+        C1-)MC: UDP_POINTER|a1b2c3d4|412.0|308.5
+        MC-)C2: same datagram via multicast delivery
+        C2->>C2: renderCursors() - crosshair overlay with fade
     end
 ```
 
