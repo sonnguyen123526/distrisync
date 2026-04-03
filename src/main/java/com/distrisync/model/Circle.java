@@ -5,14 +5,16 @@ import java.util.UUID;
 /**
  * A circle (or ellipse) shape anchored at its center.
  *
- * @param objectId   stable CRDT identity
- * @param timestamp  Lamport clock value at creation / last mutation
- * @param color      stroke color
- * @param x          center X
- * @param y          center Y
- * @param radius     radius in logical pixels; must be positive
- * @param filled     {@code true} if the interior is filled with {@code color}
+ * @param objectId    stable CRDT identity
+ * @param timestamp   Lamport clock value at creation / last mutation
+ * @param color       stroke color
+ * @param x           center X
+ * @param y           center Y
+ * @param radius      radius in logical pixels; must be positive
+ * @param filled      {@code true} if the interior is filled with {@code color}
  * @param strokeWidth outline thickness; ignored when {@code filled} is {@code true} and {@code strokeWidth == 0}
+ * @param authorName  display name of the user who drew this shape
+ * @param clientId    session-scoped client identifier of the creator
  */
 public record Circle(
         UUID   objectId,
@@ -22,7 +24,9 @@ public record Circle(
         double y,
         double radius,
         boolean filled,
-        double strokeWidth
+        double strokeWidth,
+        String authorName,
+        String clientId
 ) implements Shape {
 
     public Circle {
@@ -30,15 +34,37 @@ public record Circle(
         if (color == null || color.isBlank()) throw new IllegalArgumentException("color must not be blank");
         if (radius <= 0) throw new IllegalArgumentException("radius must be positive");
         if (strokeWidth < 0) throw new IllegalArgumentException("strokeWidth must be non-negative");
+        if (authorName == null) authorName = "";
+        if (clientId   == null) clientId   = "";
     }
 
-    /** Convenience factory — hollow circle with default 1 px stroke. */
+    /**
+     * Convenience factory — hollow circle with default 1 px stroke.
+     * Attribution defaults to empty strings (anonymous / legacy).
+     */
     public static Circle create(String color, double x, double y, double radius) {
-        return new Circle(UUID.randomUUID(), System.currentTimeMillis(), color, x, y, radius, false, 1.0);
+        return new Circle(UUID.randomUUID(), System.currentTimeMillis(), color, x, y, radius, false, 1.0, "", "");
     }
 
-    /** Convenience factory for a filled circle. */
+    /** Attributed convenience factory for a hollow circle. */
+    public static Circle create(String color, double x, double y, double radius,
+                                String authorName, String clientId) {
+        return new Circle(UUID.randomUUID(), System.currentTimeMillis(), color,
+                          x, y, radius, false, 1.0, authorName, clientId);
+    }
+
+    /**
+     * Convenience factory for a filled circle.
+     * Attribution defaults to empty strings (anonymous / legacy).
+     */
     public static Circle createFilled(String color, double x, double y, double radius) {
-        return new Circle(UUID.randomUUID(), System.currentTimeMillis(), color, x, y, radius, true, 0.0);
+        return new Circle(UUID.randomUUID(), System.currentTimeMillis(), color, x, y, radius, true, 0.0, "", "");
+    }
+
+    /** Attributed convenience factory for a filled circle. */
+    public static Circle createFilled(String color, double x, double y, double radius,
+                                      String authorName, String clientId) {
+        return new Circle(UUID.randomUUID(), System.currentTimeMillis(), color,
+                          x, y, radius, true, 0.0, authorName, clientId);
     }
 }

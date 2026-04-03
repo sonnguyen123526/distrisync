@@ -1,6 +1,7 @@
 package com.distrisync.server;
 
 import com.distrisync.model.Circle;
+import com.distrisync.model.EraserPath;
 import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
@@ -122,9 +123,10 @@ final class ShapeCodec {
             throw new IllegalArgumentException("Shape envelope missing '" + TYPE_FIELD + "' field");
         }
         return switch (typeEl.getAsString()) {
-            case "Line"     -> GSON.fromJson(envelope, Line.class);
-            case "Circle"   -> GSON.fromJson(envelope, Circle.class);
-            case "TextNode" -> GSON.fromJson(envelope, TextNode.class);
+            case "Line"        -> GSON.fromJson(envelope, Line.class);
+            case "Circle"      -> GSON.fromJson(envelope, Circle.class);
+            case "TextNode"    -> GSON.fromJson(envelope, TextNode.class);
+            case "EraserPath"  -> GSON.fromJson(envelope, EraserPath.class);
             default -> throw new IllegalArgumentException(
                     "Unknown shape type discriminator: " + typeEl.getAsString());
         };

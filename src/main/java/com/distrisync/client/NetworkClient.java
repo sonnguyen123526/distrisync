@@ -1,11 +1,13 @@
 package com.distrisync.client;
 
 import com.distrisync.model.Circle;
+import com.distrisync.model.EraserPath;
 import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
 import com.distrisync.protocol.Message;
 import com.distrisync.protocol.MessageCodec;
+import com.distrisync.protocol.MessageCodec.TextUpdatePayload;
 import com.distrisync.protocol.MessageType;
 import com.distrisync.protocol.PartialMessageException;
 import com.google.gson.Gson;
@@ -26,6 +28,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.lang.reflect.Type;
 import java.net.InetSocketAddress;
+import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
@@ -92,6 +95,8 @@ public final class NetworkClient implements AutoCloseable {
 
     private final String host;
     private final int    port;
+    private final String authorName;
+    private final String clientId;
 
     /** Thread-safe listener registry; copy-on-write for lock-free iteration. */
     private final CopyOnWriteArrayList<CanvasUpdateListener> listeners =
@@ -125,19 +130,36 @@ public final class NetworkClient implements AutoCloseable {
     // =========================================================================
 
     /**
-     * Creates a {@code NetworkClient} targeting the given server endpoint.
+     * Creates an anonymous {@code NetworkClient} targeting the given server endpoint.
+     * Attribution fields default to empty string / random UUID.
      * Call {@link #connect()} to establish the connection.
      *
      * @param host server host name or IP; must not be blank
      * @param port server TCP port; must be in [1, 65535]
      */
     public NetworkClient(String host, int port) {
+        this(host, port, "", java.util.UUID.randomUUID().toString());
+    }
+
+    /**
+     * Creates an attributed {@code NetworkClient} targeting the given server endpoint.
+     * The {@code authorName} and {@code clientId} are embedded in the {@code HANDSHAKE}
+     * frame and attached to every shape the client mutates.
+     *
+     * @param host       server host name or IP; must not be blank
+     * @param port       server TCP port; must be in [1, 65535]
+     * @param authorName human-readable display name; may be empty but not {@code null}
+     * @param clientId   stable session identifier; may be empty but not {@code null}
+     */
+    public NetworkClient(String host, int port, String authorName, String clientId) {
         if (host == null || host.isBlank())
             throw new IllegalArgumentException("host must not be blank");
         if (port < 1 || port > 65_535)
             throw new IllegalArgumentException("Invalid port: " + port);
-        this.host = host;
-        this.port = port;
+        this.host       = host;
+        this.port       = port;
+        this.authorName = authorName != null ? authorName : "";
+        this.clientId   = clientId   != null ? clientId   : "";
     }
 
     // =========================================================================
@@ -178,11 +200,122 @@ public final class NetworkClient implements AutoCloseable {
         if (shape == null) throw new IllegalArgumentException("shape must not be null");
         if (!running.get()) throw new IllegalStateException("NetworkClient is not running");
 
-        ByteBuffer frame = MessageCodec.encode(
-                new Message(MessageType.MUTATION, ClientShapeCodec.encodeMutation(shape)));
-        writeQueue.offer(frame);
+        enqueueFrame(MessageCodec.encode(
+                new Message(MessageType.MUTATION, ClientShapeCodec.encodeMutation(shape))));
+    }
 
-        // Wake the write thread in case it is parked waiting for work.
+    /**
+     * Enqueues a {@code SHAPE_START} frame signalling that this client began
+     * drawing a new shape.  Silently no-ops when not connected.
+     */
+    public void sendShapeStart(UUID shapeId, String tool, String color,
+                               double strokeWidth, double x, double y) {
+        if (!running.get()) return;
+        record Payload(String shapeId, String tool, String color,
+                       double strokeWidth, double x, double y, String authorName) {}
+        enqueueFrame(MessageCodec.encodeObject(MessageType.SHAPE_START,
+                new Payload(shapeId.toString(), tool, color, strokeWidth, x, y, authorName)));
+    }
+
+    /**
+     * Enqueues a {@code SHAPE_UPDATE} frame with the latest cursor tip
+     * coordinates for a shape that is currently being drawn.
+     * Silently no-ops when not connected.
+     */
+    public void sendShapeUpdate(UUID shapeId, double x, double y) {
+        if (!running.get()) return;
+        record Payload(String shapeId, double x, double y) {}
+        enqueueFrame(MessageCodec.encodeObject(MessageType.SHAPE_UPDATE,
+                new Payload(shapeId.toString(), x, y)));
+    }
+
+    /**
+     * Enqueues a {@code SHAPE_COMMIT} frame signalling that the shape is
+     * finished.  Receivers should clear the transient preview; the final
+     * shape(s) will arrive as subsequent {@code MUTATION} frames.
+     * Silently no-ops when not connected.
+     */
+    public void sendShapeCommit(UUID shapeId) {
+        if (!running.get()) return;
+        record Payload(String shapeId) {}
+        enqueueFrame(MessageCodec.encodeObject(MessageType.SHAPE_COMMIT,
+                new Payload(shapeId.toString())));
+    }
+
+    /**
+     * Enqueues a {@code TEXT_UPDATE} frame carrying the current (uncommitted)
+     * content of a text node that is being actively edited.
+     *
+     * <p>The server relays the frame to all other connected clients immediately
+     * without persisting it — receivers should update a transient "ghost" overlay
+     * rather than committing the text to their authoritative canvas store.  The
+     * final committed {@link com.distrisync.model.TextNode} arrives later as a
+     * normal {@code MUTATION} frame.
+     *
+     * <p>Silently no-ops when not connected.
+     *
+     * @param objectId    stable UUID of the text node being edited; must not be {@code null}
+     * @param x           X anchor coordinate of the text node on the canvas
+     * @param y           Y anchor coordinate of the text node on the canvas
+     * @param currentText the in-progress (uncommitted) text; must not be {@code null}
+     */
+    public void sendTextUpdate(UUID objectId, double x, double y, String currentText) {
+        if (objectId    == null) throw new IllegalArgumentException("objectId must not be null");
+        if (currentText == null) throw new IllegalArgumentException("currentText must not be null");
+        if (!running.get()) return;
+        enqueueFrame(MessageCodec.encodeTextUpdate(objectId, clientId, authorName, x, y, currentText));
+        log.debug("TEXT_UPDATE enqueued objectId={}", objectId);
+    }
+
+    /**
+     * Sends a {@code CLEAR_USER_SHAPES} request to the server carrying this
+     * client's own {@code clientId} as the payload.  The server will remove all
+     * shapes owned by this client from its authoritative state and relay the
+     * frame to every other connected peer so they can mirror the scoped clear.
+     * The calling client is responsible for removing its own shapes from the
+     * local canvas immediately, without waiting for an echo.
+     *
+     * <p>Silently no-ops when not connected.
+     */
+    public void sendClearUserShapes() {
+        if (!running.get()) return;
+        enqueueFrame(MessageCodec.encodeClearUserShapes(clientId));
+        log.debug("CLEAR_USER_SHAPES enqueued clientId={}", clientId);
+    }
+
+    /**
+     * Sends an {@code UNDO_REQUEST} to the server asking it to delete the shape
+     * identified by {@code shapeId}.  If the shape exists in the authoritative
+     * state the server removes it and broadcasts a {@code SHAPE_DELETE} frame to
+     * all other clients.  The calling client should remove the shape from its
+     * local store immediately, without waiting for an echo.
+     *
+     * <p>Silently no-ops when not connected.
+     *
+     * @param shapeId the {@link UUID} of the shape to delete; must not be {@code null}
+     */
+    public void sendUndoRequest(UUID shapeId) {
+        if (shapeId == null) throw new IllegalArgumentException("shapeId must not be null");
+        if (!running.get()) return;
+        record Payload(String shapeId) {}
+        enqueueFrame(MessageCodec.encodeObject(MessageType.UNDO_REQUEST,
+                new Payload(shapeId.toString())));
+        log.debug("UNDO_REQUEST enqueued shapeId={}", shapeId);
+    }
+
+    /** Returns the author name this client advertised in its {@code HANDSHAKE}. */
+    public String getAuthorName() {
+        return authorName;
+    }
+
+    /** Returns the client-ID this client advertised in its {@code HANDSHAKE}. */
+    public String getClientId() {
+        return clientId;
+    }
+
+    /** Adds {@code frame} to the write queue and unparks the write thread. */
+    private void enqueueFrame(ByteBuffer frame) {
+        writeQueue.offer(frame);
         Thread wt = writeThread;
         if (wt != null) LockSupport.unpark(wt);
     }
@@ -251,6 +384,13 @@ public final class NetworkClient implements AutoCloseable {
                     host, port, attempt, MAX_RECONNECT_ATTEMPTS);
             try {
                 SocketChannel sc = SocketChannel.open();
+                // Disable Nagle's algorithm before the connect syscall so the OS
+                // never buffers small frames (cursor ticks, live-text events).
+                sc.setOption(StandardSocketOptions.TCP_NODELAY, true);
+                // 64 KiB kernel socket buffers absorb large snapshots without
+                // blocking the write loop mid-frame.
+                sc.setOption(StandardSocketOptions.SO_SNDBUF, 64 * 1024);
+                sc.setOption(StandardSocketOptions.SO_RCVBUF, 64 * 1024);
                 sc.configureBlocking(true);
                 sc.connect(new InetSocketAddress(host, port));
                 log.info("TCP connection established to {}:{}", host, port);
@@ -278,13 +418,18 @@ public final class NetworkClient implements AutoCloseable {
 
     /**
      * Sends a {@code HANDSHAKE} frame synchronously on the current channel.
+     * The payload carries {@code authorName} and {@code clientId} so the server
+     * can associate subsequent mutations with the originating user.
      * This always completes before the I/O threads are started (or restarted
      * after a reconnect), so no locking is required here.
      */
     private void sendHandshake() throws IOException {
-        ByteBuffer handshake = MessageCodec.encode(Message.empty(MessageType.HANDSHAKE));
+        record HandshakePayload(String authorName, String clientId) {}
+        ByteBuffer handshake = MessageCodec.encodeObject(
+                MessageType.HANDSHAKE, new HandshakePayload(authorName, clientId));
         writeBlocking(channel, handshake);
-        log.debug("HANDSHAKE sent to {}:{}", host, port);
+        log.debug("HANDSHAKE sent to {}:{} authorName='{}' clientId='{}'",
+                host, port, authorName, clientId);
     }
 
     /**
@@ -419,6 +564,86 @@ public final class NetworkClient implements AutoCloseable {
                     listener.onMutationReceived(shape);
                 }
             }
+            case SHAPE_START -> {
+                try {
+                    JsonObject p      = MessageCodec.gson().fromJson(msg.payload(), JsonObject.class);
+                    UUID   shapeId    = UUID.fromString(p.get("shapeId").getAsString());
+                    String tool       = p.get("tool").getAsString();
+                    String color      = p.get("color").getAsString();
+                    double strokeW    = p.get("strokeWidth").getAsDouble();
+                    double x          = p.get("x").getAsDouble();
+                    double y          = p.get("y").getAsDouble();
+                    String author     = p.has("authorName") && !p.get("authorName").isJsonNull()
+                                        ? p.get("authorName").getAsString() : "";
+                    for (CanvasUpdateListener listener : listeners) {
+                        listener.onShapeStart(shapeId, tool, color, strokeW, x, y, author);
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed SHAPE_START payload ignored: {}", e.getMessage());
+                }
+            }
+            case SHAPE_UPDATE -> {
+                try {
+                    JsonObject p   = MessageCodec.gson().fromJson(msg.payload(), JsonObject.class);
+                    UUID   shapeId = UUID.fromString(p.get("shapeId").getAsString());
+                    double x       = p.get("x").getAsDouble();
+                    double y       = p.get("y").getAsDouble();
+                    for (CanvasUpdateListener listener : listeners) {
+                        listener.onShapeUpdate(shapeId, x, y);
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed SHAPE_UPDATE payload ignored: {}", e.getMessage());
+                }
+            }
+            case SHAPE_COMMIT -> {
+                try {
+                    JsonObject p   = MessageCodec.gson().fromJson(msg.payload(), JsonObject.class);
+                    UUID   shapeId = UUID.fromString(p.get("shapeId").getAsString());
+                    for (CanvasUpdateListener listener : listeners) {
+                        listener.onShapeCommit(shapeId);
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed SHAPE_COMMIT payload ignored: {}", e.getMessage());
+                }
+            }
+            case CLEAR_USER_SHAPES -> {
+                String targetClientId;
+                try {
+                    targetClientId = MessageCodec.decodeClearUserShapes(msg);
+                } catch (Exception e) {
+                    log.debug("Malformed CLEAR_USER_SHAPES payload ignored: {}", e.getMessage());
+                    break;
+                }
+                log.debug("CLEAR_USER_SHAPES received targetClientId={}", targetClientId);
+                for (CanvasUpdateListener listener : listeners) {
+                    listener.onUserShapesCleared(targetClientId);
+                }
+            }
+            case SHAPE_DELETE -> {
+                try {
+                    JsonObject p   = MessageCodec.gson().fromJson(msg.payload(), JsonObject.class);
+                    UUID   shapeId = UUID.fromString(p.get("shapeId").getAsString());
+                    log.debug("SHAPE_DELETE received shapeId={}", shapeId);
+                    for (CanvasUpdateListener listener : listeners) {
+                        listener.onShapeDeleted(shapeId);
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed SHAPE_DELETE payload ignored: {}", e.getMessage());
+                }
+            }
+            case TEXT_UPDATE -> {
+                try {
+                    TextUpdatePayload p = MessageCodec.decodeTextUpdate(msg);
+                    UUID objectId = UUID.fromString(p.objectId());
+                    log.debug("TEXT_UPDATE received objectId={} clientId={}", objectId, p.clientId());
+                    for (CanvasUpdateListener listener : listeners) {
+                        listener.onTextUpdate(objectId, p.clientId(), p.authorName(),
+                                              p.x(), p.y(), p.currentText());
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed TEXT_UPDATE payload ignored: {}", e.getMessage());
+                }
+            }
             default -> log.trace("Ignoring server-bound message type: {}", msg.type());
         }
     }
@@ -541,9 +766,10 @@ public final class NetworkClient implements AutoCloseable {
                         "Shape envelope is missing the '" + TYPE_FIELD + "' discriminator field");
             }
             return switch (typeElement.getAsString()) {
-                case "Line"     -> GSON.fromJson(envelope, Line.class);
-                case "Circle"   -> GSON.fromJson(envelope, Circle.class);
-                case "TextNode" -> GSON.fromJson(envelope, TextNode.class);
+                case "Line"       -> GSON.fromJson(envelope, Line.class);
+                case "Circle"     -> GSON.fromJson(envelope, Circle.class);
+                case "TextNode"   -> GSON.fromJson(envelope, TextNode.class);
+                case "EraserPath" -> GSON.fromJson(envelope, EraserPath.class);
                 default -> throw new IllegalArgumentException(
                         "Unknown shape type discriminator: '" + typeElement.getAsString() + "'");
             };
