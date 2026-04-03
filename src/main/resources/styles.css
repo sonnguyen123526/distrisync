@@ -1,0 +1,62 @@
+/* ═══════════════════════════════════════════════════════════════
+   DistriSync — Tailwind-inspired Design System
+   Loaded via scene.getStylesheets() in WhiteboardApp.java
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Sidebar container ──────────────────────────────────────── */
+.sidebar {
+    -fx-background-color: #0f172a;
+    -fx-padding: 20;
+}
+
+/* ── Section header labels ──────────────────────────────────── */
+.section-header {
+    -fx-text-fill: #94a3b8;
+    -fx-font-size: 11px;
+    -fx-font-weight: bold;
+    /* Simulate letter-spacing with wider character spacing via padding */
+    -fx-label-padding: 0 0 8 0;
+}
+
+/* ── Tool toggle buttons ────────────────────────────────────── */
+.tool-button {
+    -fx-background-color: #1e293b;
+    -fx-text-fill: #f8fafc;
+    -fx-background-radius: 6;
+    -fx-padding: 8 12 8 12;
+    -fx-cursor: hand;
+    -fx-alignment: CENTER_LEFT;
+    -fx-border-width: 0;
+    -fx-font-size: 13px;
+}
+
+.tool-button:hover {
+    -fx-background-color: #334155;
+}
+
+.tool-button:selected {
+    -fx-background-color: #3b82f6;
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+}
+
+/* ── Danger (destructive action) button ─────────────────────── */
+.danger-button {
+    -fx-background-color: #e11d48;
+    -fx-text-fill: #ffffff;
+    -fx-background-radius: 6;
+    -fx-padding: 8 12 8 12;
+    -fx-cursor: hand;
+    -fx-font-size: 13px;
+    -fx-border-width: 0;
+}
+
+.danger-button:hover {
+    -fx-background-color: #be123c;
+}
+
+/* ── Connection status indicator ────────────────────────────── */
+.status-text {
+    -fx-text-fill: #10b981;
+    -fx-font-size: 12px;
+}

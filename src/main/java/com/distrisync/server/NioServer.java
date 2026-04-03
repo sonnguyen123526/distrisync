@@ -5,11 +5,14 @@ import com.distrisync.protocol.Message;
 import com.distrisync.protocol.MessageCodec;
 import com.distrisync.protocol.MessageType;
 import com.distrisync.protocol.PartialMessageException;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
@@ -18,6 +21,7 @@ import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -180,6 +184,14 @@ public final class NioServer implements Runnable {
         }
 
         clientChannel.configureBlocking(false);
+        // Disable Nagle's algorithm so small frames (cursor updates, text events)
+        // are sent immediately without waiting for ACKs or buffer fill.
+        clientChannel.setOption(StandardSocketOptions.TCP_NODELAY, true);
+        // Ensure kernel socket buffers are at least 64 KiB each to absorb
+        // burst traffic without stalling the event loop.
+        clientChannel.setOption(StandardSocketOptions.SO_SNDBUF, 64 * 1024);
+        clientChannel.setOption(StandardSocketOptions.SO_RCVBUF, 64 * 1024);
+
         ClientSession session = new ClientSession();
         clientChannel.register(selector, SelectionKey.OP_READ, session);
 
@@ -254,7 +266,23 @@ public final class NioServer implements Runnable {
         ClientSession session = (ClientSession) senderKey.attachment();
 
         switch (msg.type()) {
-            case HANDSHAKE -> log.debug("HANDSHAKE received from session={} (no-op on server)", session.sessionId);
+            case HANDSHAKE -> {
+                // Extract authorName and clientId so subsequent shape mutations can
+                // be correlated with the originating user in server logs.
+                try {
+                    JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
+                    if (p.has("authorName") && !p.get("authorName").isJsonNull()) {
+                        session.authorName = p.get("authorName").getAsString();
+                    }
+                    if (p.has("clientId") && !p.get("clientId").isJsonNull()) {
+                        session.clientId = p.get("clientId").getAsString();
+                    }
+                } catch (Exception ignored) {
+                    // Malformed handshake payload — keep defaults
+                }
+                log.info("HANDSHAKE session={} authorName='{}' clientId='{}'",
+                        session.sessionId, session.authorName, session.clientId);
+            }
 
             case MUTATION -> {
                 Shape shape;
@@ -269,15 +297,75 @@ public final class NioServer implements Runnable {
                 boolean applied = stateManager.applyMutation(shape);
 
                 if (applied) {
-                    log.info("MUTATION accepted  type={} id={} ts={} from={}",
+                    log.info("MUTATION accepted  type={} id={} ts={} author='{}' from={}",
                             shape.getClass().getSimpleName(), shape.objectId(),
-                            shape.timestamp(), session.sessionId);
+                            shape.timestamp(), shape.authorName(), session.sessionId);
 
-                    // Re-encode using the already-decoded message to produce identical bytes.
                     ByteBuffer frame = MessageCodec.encode(msg);
                     broadcastExcept(frame, senderKey, selector);
                 } else {
                     log.debug("MUTATION rejected (stale)  id={} from={}", shape.objectId(), session.sessionId);
+                }
+            }
+
+            // Ephemeral live-drawing events — relay to all other clients without
+            // touching the canvas state manager (these frames are never persisted).
+            case SHAPE_START, SHAPE_UPDATE, SHAPE_COMMIT -> {
+                log.debug("{} relayed from session={}", msg.type(), session.sessionId);
+                ByteBuffer frame = MessageCodec.encode(msg);
+                broadcastExcept(frame, senderKey, selector);
+            }
+
+            // Ephemeral live-typing event — relay immediately to all other clients.
+            // TEXT_UPDATE frames are transient: they carry in-progress (uncommitted)
+            // text and must NOT be written to the persistent shapeMap.  The final
+            // committed TextNode arrives as a normal MUTATION once the user confirms.
+            case TEXT_UPDATE -> {
+                log.debug("TEXT_UPDATE relayed from session={}", session.sessionId);
+                ByteBuffer frame = MessageCodec.encode(msg);
+                broadcastExcept(frame, senderKey, selector);
+            }
+
+            case CLEAR_USER_SHAPES -> {
+                String targetClientId;
+                try {
+                    targetClientId = MessageCodec.decodeClearUserShapes(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed CLEAR_USER_SHAPES payload from session={}: {}", session.sessionId, e.getMessage());
+                    return;
+                }
+                stateManager.clearUserShapes(targetClientId);
+                log.info("CLEAR_USER_SHAPES from session={} targetClientId='{}'",
+                        session.sessionId, targetClientId);
+                // Broadcast the exact same scoped-clear frame so all peers remove
+                // only the shapes belonging to that clientId from their local view.
+                ByteBuffer frame = MessageCodec.encodeClearUserShapes(targetClientId);
+                broadcastExcept(frame, senderKey, selector);
+            }
+
+            case UNDO_REQUEST -> {
+                // Payload: { "shapeId": "<uuid-string>" }
+                UUID shapeId;
+                try {
+                    JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
+                    shapeId = UUID.fromString(p.get("shapeId").getAsString());
+                } catch (Exception e) {
+                    log.warn("Malformed UNDO_REQUEST payload from session={}: {}", session.sessionId, e.getMessage());
+                    return;
+                }
+
+                boolean deleted = stateManager.deleteShape(shapeId);
+                if (deleted) {
+                    log.info("UNDO_REQUEST accepted  shapeId={} author='{}' session={}",
+                            shapeId, session.authorName, session.sessionId);
+                    // Notify all OTHER clients to remove the shape from their canvas.
+                    record ShapeDeletePayload(String shapeId) {}
+                    ByteBuffer frame = MessageCodec.encodeObject(
+                            MessageType.SHAPE_DELETE, new ShapeDeletePayload(shapeId.toString()));
+                    broadcastExcept(frame, senderKey, selector);
+                } else {
+                    log.debug("UNDO_REQUEST no-op (shape not found)  shapeId={} session={}",
+                            shapeId, session.sessionId);
                 }
             }
 

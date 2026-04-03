@@ -1,6 +1,7 @@
 package com.distrisync.server;
 
 import com.distrisync.model.Circle;
+import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
 import org.junit.jupiter.api.Test;
@@ -8,11 +9,13 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -127,7 +130,7 @@ class CanvasStateManagerTest {
         // -----------------------------------------------------------------
         TextNode winner = new TextNode(
                 sharedId, 1000L, "#000000", 0.0, 0.0,
-                "Winner", "Arial", 14, false, false);
+                "Winner", "Arial", 14, false, false, "Alice", "client-alice");
 
         boolean firstApplied = manager.applyMutation(winner);
 
@@ -140,7 +143,7 @@ class CanvasStateManagerTest {
         // -----------------------------------------------------------------
         TextNode stale = new TextNode(
                 sharedId, 900L, "#FF0000", 100.0, 100.0,
-                "Stale", "Arial", 14, false, false);
+                "Stale", "Arial", 14, false, false, "Bob", "client-bob");
 
         boolean staleApplied = manager.applyMutation(stale);
 
@@ -165,7 +168,7 @@ class CanvasStateManagerTest {
         // -----------------------------------------------------------------
         TextNode duplicate = new TextNode(
                 sharedId, 1000L, "#0000FF", 200.0, 200.0,
-                "Duplicate", "Arial", 14, false, false);
+                "Duplicate", "Arial", 14, false, false, "Alice", "client-alice");
 
         boolean duplicateApplied = manager.applyMutation(duplicate);
 
@@ -183,7 +186,7 @@ class CanvasStateManagerTest {
         // -----------------------------------------------------------------
         TextNode superseder = new TextNode(
                 sharedId, 2000L, "#00FF00", 50.0, 50.0,
-                "Superseder", "Arial", 16, true, false);
+                "Superseder", "Arial", 16, true, false, "Charlie", "client-charlie");
 
         boolean supersederApplied = manager.applyMutation(superseder);
 
@@ -273,5 +276,355 @@ class CanvasStateManagerTest {
         assertThat(manager.snapshot())
                 .as("a fresh snapshot() call must include the 6th shape")
                 .hasSize(6);
+    }
+
+    // =========================================================================
+    // testUndoShapeRemoval
+    // =========================================================================
+
+    /**
+     * Verifies the full behavioural contract of {@link CanvasStateManager#deleteShape}:
+     *
+     * <ol>
+     *   <li><b>Targeted removal</b> — deleting by a specific {@link UUID} removes
+     *       exactly that shape; the other two remain intact.</li>
+     *   <li><b>Return value semantics</b> — {@code true} when the shape existed,
+     *       {@code false} on a second call for the same id (idempotency).</li>
+     *   <li><b>Identity preservation</b> — the surviving shapes' {@code objectId}s
+     *       and field values are not modified by the deletion.</li>
+     *   <li><b>Snapshot integrity</b> — after deletion, {@code snapshot()} returns
+     *       exactly the remaining shapes; the deleted id is absent.</li>
+     * </ol>
+     *
+     * <p>Three shapes with <em>pinned</em> UUIDs are used so assertion failures
+     * produce deterministic, human-readable output identifying which shape was
+     * wrongly retained or removed.
+     */
+    @Test
+    void testUndoShapeRemoval() {
+        CanvasStateManager manager = new CanvasStateManager();
+
+        // Three shapes with well-known, deterministic UUIDs — pinning the ids
+        // makes assertion failure messages immediately actionable.
+        UUID id1 = UUID.fromString("11111111-1111-1111-1111-111111111111");
+        UUID id2 = UUID.fromString("22222222-2222-2222-2222-222222222222");
+        UUID id3 = UUID.fromString("33333333-3333-3333-3333-333333333333");
+
+        Shape shape1 = new Line(id1, 1000L, "#FF0000", 0, 0, 10, 10, 2.0, "Alice", "c1");
+        Shape shape2 = new Circle(id2, 2000L, "#00FF00", 50, 50, 25, false, 1.5, "Bob", "c2");
+        Shape shape3 = new TextNode(id3, 3000L, "#0000FF", 100, 100,
+                                    "Hello", "Arial", 14, false, false, "Charlie", "c3");
+
+        manager.applyMutation(shape1);
+        manager.applyMutation(shape2);
+        manager.applyMutation(shape3);
+
+        assertThat(manager.size())
+                .as("pre-condition: all 3 shapes must be stored before delete")
+                .isEqualTo(3);
+
+        // --- act: delete the middle shape (shape2, the Circle) ----------------
+        boolean firstDelete = manager.deleteShape(id2);
+
+        // --- assert: return value semantics -----------------------------------
+        assertThat(firstDelete)
+                .as("deleteShape must return true when the shape existed")
+                .isTrue();
+
+        // --- assert: map size -------------------------------------------------
+        assertThat(manager.size())
+                .as("size must drop to 2 after one deletion")
+                .isEqualTo(2);
+
+        // --- assert: snapshot integrity ---------------------------------------
+        List<Shape> remaining = manager.snapshot();
+        assertThat(remaining)
+                .as("snapshot must contain exactly 2 shapes after deletion")
+                .hasSize(2);
+
+        Set<UUID> remainingIds = remaining.stream()
+                .map(Shape::objectId)
+                .collect(Collectors.toSet());
+
+        assertThat(remainingIds)
+                .as("shape1 (Line) must still be present after deleting shape2")
+                .contains(id1);
+        assertThat(remainingIds)
+                .as("shape3 (TextNode) must still be present after deleting shape2")
+                .contains(id3);
+        assertThat(remainingIds)
+                .as("deleted shape2 (Circle) must NOT appear in the snapshot")
+                .doesNotContain(id2);
+
+        // --- assert: idempotency — second delete of the same id returns false --
+        boolean secondDelete = manager.deleteShape(id2);
+        assertThat(secondDelete)
+                .as("deleteShape must return false when the shape no longer exists (idempotent)")
+                .isFalse();
+
+        assertThat(manager.size())
+                .as("size must remain 2 after the idempotent second delete")
+                .isEqualTo(2);
+
+        // --- assert: surviving shapes are field-value identical to originals --
+        Shape retained1 = remaining.stream()
+                .filter(s -> s.objectId().equals(id1))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("shape1 missing from snapshot"));
+        assertThat(retained1)
+                .as("shape1's field values must be unchanged after an unrelated deletion")
+                .isEqualTo(shape1);
+
+        Shape retained3 = remaining.stream()
+                .filter(s -> s.objectId().equals(id3))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("shape3 missing from snapshot"));
+        assertThat(retained3)
+                .as("shape3's field values must be unchanged after an unrelated deletion")
+                .isEqualTo(shape3);
+    }
+
+    // =========================================================================
+    // testClearUserShapes
+    // =========================================================================
+
+    /**
+     * Verifies the full behavioural contract of
+     * {@link CanvasStateManager#clearUserShapes}:
+     *
+     * <ol>
+     *   <li><b>Scoped removal</b> — only shapes whose {@link Shape#clientId()}
+     *       matches the supplied argument are removed; shapes owned by other
+     *       clients are left untouched.</li>
+     *   <li><b>Idempotency</b> — a second call for the same clientId when no
+     *       shapes remain is a safe no-op.</li>
+     *   <li><b>Unknown clientId</b> — calling with a clientId that owns no
+     *       shapes is a safe no-op.</li>
+     *   <li><b>Operational continuity</b> — the store accepts new mutations
+     *       for that clientId after the clear.</li>
+     * </ol>
+     */
+    @Test
+    void testClearUserShapes() {
+        CanvasStateManager manager = new CanvasStateManager();
+
+        UUID id1 = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+        UUID id2 = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
+        UUID id3 = UUID.fromString("cccccccc-cccc-cccc-cccc-cccccccccccc");
+
+        Shape alice1 = new Line(id1, 1000L, "#FF0000", 0, 0, 10, 10, 2.0, "Alice", "client-alice");
+        Shape alice2 = new Circle(id2, 2000L, "#00FF00", 50, 50, 25, false, 1.5, "Alice", "client-alice");
+        Shape bob    = new TextNode(id3, 3000L, "#0000FF", 100, 100,
+                                   "Hello", "Arial", 14, false, false, "Bob", "client-bob");
+
+        manager.applyMutation(alice1);
+        manager.applyMutation(alice2);
+        manager.applyMutation(bob);
+
+        assertThat(manager.size())
+                .as("pre-condition: all 3 shapes must be stored before clearUserShapes")
+                .isEqualTo(3);
+
+        // --- act: clear only Alice's shapes -----------------------------------
+        manager.clearUserShapes("client-alice");
+
+        // --- assert: scoped removal -------------------------------------------
+        assertThat(manager.size())
+                .as("size must be 1 — only Bob's shape survives")
+                .isEqualTo(1);
+
+        List<Shape> remaining = manager.snapshot();
+        assertThat(remaining).hasSize(1);
+        assertThat(remaining.get(0).objectId())
+                .as("Bob's shape must be the sole survivor")
+                .isEqualTo(id3);
+        assertThat(remaining.get(0).clientId())
+                .as("surviving shape's clientId must be client-bob")
+                .isEqualTo("client-bob");
+
+        // --- assert: idempotency — second clear for the same user is a no-op -
+        manager.clearUserShapes("client-alice");
+        assertThat(manager.size())
+                .as("size must remain 1 after idempotent second clearUserShapes")
+                .isEqualTo(1);
+
+        // --- assert: unknown clientId is a safe no-op -------------------------
+        manager.clearUserShapes("client-unknown");
+        assertThat(manager.size())
+                .as("size must remain 1 after clearUserShapes for an unknown clientId")
+                .isEqualTo(1);
+
+        // --- assert: null argument throws -------------------------------------
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> manager.clearUserShapes(null))
+                .withMessageContaining("targetClientId");
+
+        // --- assert: store is still operational after a scoped clear ----------
+        Shape aliceNew = new Circle(UUID.randomUUID(), 9000L, "#FF00FF",
+                                    5, 5, 3, false, 1.0, "Alice", "client-alice");
+        boolean accepted = manager.applyMutation(aliceNew);
+        assertThat(accepted)
+                .as("applyMutation must succeed for Alice after her shapes were cleared")
+                .isTrue();
+        assertThat(manager.size())
+                .as("size must be 2 after Alice inserts a new shape post-clear")
+                .isEqualTo(2);
+    }
+
+    // =========================================================================
+    // testScopedClear_RemovesOnlyTargetUser
+    // =========================================================================
+
+    /**
+     * Focuses specifically on the partition-correctness of
+     * {@link CanvasStateManager#clearUserShapes}: given shapes distributed
+     * across two client identifiers, clearing one client's shapes must leave
+     * every surviving shape owned exclusively by the other client.
+     *
+     * <p>Setup: 3 shapes for {@code "UserA"} + 2 shapes for {@code "UserB"}.
+     *
+     * <p>The iteration-level assertion — checking {@link Shape#clientId()} for
+     * every remaining entry — ensures the predicate logic in
+     * {@link java.util.concurrent.ConcurrentHashMap#values()
+     * .removeIf(Predicate)} does not accidentally over-delete or under-delete.
+     */
+    @Test
+    void testScopedClear_RemovesOnlyTargetUser() {
+        CanvasStateManager manager = new CanvasStateManager();
+
+        // Insert 3 shapes for UserA with distinct, deterministic timestamps.
+        for (int i = 1; i <= 3; i++) {
+            manager.applyMutation(new Circle(
+                    UUID.randomUUID(), i * 1_000L,
+                    "#FF0000", i * 10.0, i * 10.0, 5.0,
+                    false, 1.0,
+                    "UserA", "UserA"));
+        }
+
+        // Insert 2 shapes for UserB.
+        for (int i = 1; i <= 2; i++) {
+            manager.applyMutation(new Line(
+                    UUID.randomUUID(), (i + 3) * 1_000L,
+                    "#0000FF", 0, 0, 20, 20, 1.5,
+                    "UserB", "UserB"));
+        }
+
+        assertThat(manager.size())
+                .as("pre-condition: 5 shapes total (3 UserA + 2 UserB) must be stored")
+                .isEqualTo(5);
+
+        // --- act --------------------------------------------------------------
+        manager.clearUserShapes("UserA");
+
+        // --- assert: exact surviving count ------------------------------------
+        assertThat(manager.size())
+                .as("size must be exactly 2 after clearing all 3 UserA shapes")
+                .isEqualTo(2);
+
+        // --- assert: every remaining shape belongs to UserB ------------------
+        List<Shape> remaining = manager.snapshot();
+
+        assertThat(remaining)
+                .as("snapshot must contain exactly 2 shapes post-clear")
+                .hasSize(2);
+
+        // AssertJ extracting() gives a precise per-element failure message
+        // that names the actual clientId found when the assertion fails.
+        assertThat(remaining)
+                .extracting(Shape::clientId)
+                .as("every surviving shape must be owned by 'UserB' — no UserA shapes must linger")
+                .containsOnly("UserB");
+    }
+
+    // =========================================================================
+    // testClearAll
+    // =========================================================================
+
+    /**
+     * Verifies the full behavioural contract of {@link CanvasStateManager#clearAll}:
+     *
+     * <ol>
+     *   <li><b>Total erasure</b> — {@code size()} returns 0 immediately after the
+     *       call.</li>
+     *   <li><b>Empty snapshot</b> — {@code snapshot()} returns an empty, immutable
+     *       list (not {@code null}) after clearing.</li>
+     *   <li><b>Stale-id rejection</b> — {@code deleteShape} returns {@code false}
+     *       for any id that existed before the clear, confirming the store is
+     *       truly empty.</li>
+     *   <li><b>Operational continuity</b> — {@code applyMutation} correctly accepts
+     *       new shapes after clearing, so the store is not left in a broken state.</li>
+     *   <li><b>Idempotency</b> — a second {@code clearAll()} on an already-empty
+     *       store succeeds without throwing.</li>
+     * </ol>
+     */
+    @Test
+    void testClearAll() {
+        CanvasStateManager manager = new CanvasStateManager();
+
+        // Insert 5 shapes and capture their ids for post-clear probing.
+        List<UUID> insertedIds = new ArrayList<>();
+        for (int i = 1; i <= 5; i++) {
+            Circle c = Circle.create("#AABBCC", i * 5.0, i * 5.0, i * 3.0);
+            manager.applyMutation(c);
+            insertedIds.add(c.objectId());
+        }
+
+        assertThat(manager.size())
+                .as("pre-condition: 5 shapes must be stored before clearAll")
+                .isEqualTo(5);
+
+        // --- act --------------------------------------------------------------
+        manager.clearAll();
+
+        // --- assert: total erasure --------------------------------------------
+        assertThat(manager.size())
+                .as("size() must be 0 immediately after clearAll()")
+                .isZero();
+
+        // --- assert: snapshot returns empty (not null) list -------------------
+        List<Shape> postClearSnapshot = manager.snapshot();
+
+        assertThat(postClearSnapshot)
+                .as("snapshot() must return a non-null, empty list after clearAll()")
+                .isNotNull()
+                .isEmpty();
+
+        // Verify the post-clear snapshot is still immutable.
+        assertThatExceptionOfType(UnsupportedOperationException.class)
+                .as("snapshot() after clearAll() must still be unmodifiable")
+                .isThrownBy(() -> postClearSnapshot.add(Circle.create("#000000", 0, 0, 1)));
+
+        // --- assert: deleteShape returns false for any previously-held id -----
+        for (UUID staleId : insertedIds) {
+            assertThat(manager.deleteShape(staleId))
+                    .as("deleteShape(%s) must return false — shape was erased by clearAll", staleId)
+                    .isFalse();
+        }
+
+        // --- assert: store is still operational — new shapes are accepted -----
+        Circle fresh = Circle.create("#FFFFFF", 1.0, 1.0, 1.0);
+        boolean accepted = manager.applyMutation(fresh);
+
+        assertThat(accepted)
+                .as("applyMutation must succeed after clearAll — store must not be left broken")
+                .isTrue();
+        assertThat(manager.size())
+                .as("size must be 1 after inserting exactly one new shape into the cleared store")
+                .isEqualTo(1);
+
+        // --- assert: idempotency — second clearAll on the now-populated store -
+        manager.clearAll();
+        assertThat(manager.size())
+                .as("second clearAll() must empty the store again")
+                .isZero();
+
+        // A third clearAll on a truly empty store must not throw.
+        assertThatCode(manager::clearAll)
+                .as("clearAll() on an already-empty store must not throw")
+                .doesNotThrowAnyException();
+
+        assertThat(manager.size())
+                .as("size must remain 0 after no-op clearAll on empty store")
+                .isZero();
     }
 }

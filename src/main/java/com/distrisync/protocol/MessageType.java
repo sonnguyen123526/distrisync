@@ -10,18 +10,33 @@ import java.util.Map;
  * <pre>
  * Wire value  Meaning
  * ----------  -------
- * 0x01        HANDSHAKE   – initial client→server greeting (session id, capabilities)
- * 0x02        SNAPSHOT    – full board state sent by server on join
- * 0x03        MUTATION    – incremental shape add / update / delete
- * 0x04        UDP_POINTER – ephemeral cursor-position broadcast (fire-and-forget)
+ * 0x01        HANDSHAKE    – initial client→server greeting (authorName, clientId)
+ * 0x02        SNAPSHOT     – full board state sent by server on join
+ * 0x03        MUTATION     – incremental shape add / update
+ * 0x04        UDP_POINTER  – ephemeral cursor-position broadcast (fire-and-forget)
+ * 0x05        SHAPE_START  – peer begins drawing a new shape (tool, color, origin)
+ * 0x06        SHAPE_UPDATE – incremental coordinate update for an in-progress shape
+ * 0x07        SHAPE_COMMIT – peer finished drawing; peers should flush their transient view
+ * 0x08        CLEAR_USER_SHAPES – erase all shapes owned by the requesting clientId; server broadcasts to all peers
+ * 0x09        UNDO_REQUEST  – client requests deletion of one shape by UUID (payload: shapeId)
+ * 0x0A        SHAPE_DELETE  – server confirms deletion; broadcast to all peers (payload: shapeId)
+ * 0x0B        TEXT_UPDATE   – ephemeral live-typing event; relayed to all peers without persistence
+ *                             payload: { objectId, clientId, x, y, currentText }
  * </pre>
  */
 public enum MessageType {
 
-    HANDSHAKE  ((byte) 0x01),
-    SNAPSHOT   ((byte) 0x02),
-    MUTATION   ((byte) 0x03),
-    UDP_POINTER((byte) 0x04);
+    HANDSHAKE   ((byte) 0x01),
+    SNAPSHOT    ((byte) 0x02),
+    MUTATION    ((byte) 0x03),
+    UDP_POINTER ((byte) 0x04),
+    SHAPE_START ((byte) 0x05),
+    SHAPE_UPDATE((byte) 0x06),
+    SHAPE_COMMIT((byte) 0x07),
+    CLEAR_USER_SHAPES((byte) 0x08),
+    UNDO_REQUEST((byte) 0x09),
+    SHAPE_DELETE((byte) 0x0A),
+    TEXT_UPDATE ((byte) 0x0B);
 
     private final byte wireCode;
 

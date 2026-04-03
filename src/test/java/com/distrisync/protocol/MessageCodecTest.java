@@ -1,6 +1,7 @@
 package com.distrisync.protocol;
 
 import com.distrisync.model.Circle;
+import com.distrisync.model.TextNode;
 import com.google.gson.JsonObject;
 import org.junit.jupiter.api.Test;
 
@@ -113,7 +114,8 @@ class MessageCodecTest {
                 10.0, 20.0,
                 originalRadius,
                 false,
-                1.0);
+                1.0,
+                "TestUser", "test-client-id");
 
         // --- act -----------------------------------------------------------
         ByteBuffer encoded     = MessageCodec.encodeObject(MessageType.MUTATION, circle);
@@ -177,6 +179,187 @@ class MessageCodecTest {
         assertThat(partial.position())
                 .as("buffer position must not advance on incomplete header")
                 .isZero();
+    }
+
+    // =========================================================================
+    // NEW — testEncodeDecode_UndoRequest
+    //
+    // UNDO_REQUEST carries a JSON payload with two fields:
+    //   "shapeId"    — the UUID (as a hyphenated string) of the shape to remove
+    //   "authorName" — the display name of the requesting user
+    //
+    // Asserts:
+    //   (a) the decoded MessageType is UNDO_REQUEST (wire byte 0x09)
+    //   (b) "shapeId" round-trips as a valid UUID equal to the original
+    //   (c) "authorName" survives without mutation
+    //   (d) the decoded UUID reconstructed via UUID.fromString equals the original
+    // =========================================================================
+
+    @Test
+    void testEncodeDecode_UndoRequest() {
+        // --- arrange ----------------------------------------------------------
+        UUID   targetId    = UUID.fromString("deadbeef-dead-beef-dead-beefdeadbeef");
+        String authorName  = "Alice";
+
+        // The server and client both use this record shape for the UNDO_REQUEST payload.
+        record UndoPayload(String shapeId, String authorName) {}
+        UndoPayload payload = new UndoPayload(targetId.toString(), authorName);
+
+        // --- act --------------------------------------------------------------
+        ByteBuffer encoded    = MessageCodec.encodeObject(MessageType.UNDO_REQUEST, payload);
+        Message    decoded    = MessageCodec.decode(encoded);
+
+        // --- assert: wire type ------------------------------------------------
+        assertThat(decoded.type())
+                .as("decoded type must be UNDO_REQUEST")
+                .isEqualTo(MessageType.UNDO_REQUEST);
+
+        // --- assert: payload fields via JSON ----------------------------------
+        JsonObject json = MessageCodec.gson().fromJson(decoded.payload(), JsonObject.class);
+
+        assertThat(json.has("shapeId"))
+                .as("payload must contain 'shapeId' field")
+                .isTrue();
+        assertThat(json.has("authorName"))
+                .as("payload must contain 'authorName' field")
+                .isTrue();
+
+        String rawShapeId = json.get("shapeId").getAsString();
+        assertThat(rawShapeId)
+                .as("shapeId string must match the original UUID's toString()")
+                .isEqualTo(targetId.toString());
+
+        // Reconstruct UUID from the decoded string — validates parse-ability.
+        UUID reconstructed = UUID.fromString(rawShapeId);
+        assertThat(reconstructed)
+                .as("reconstructed UUID must equal the original")
+                .isEqualTo(targetId);
+
+        assertThat(json.get("authorName").getAsString())
+                .as("authorName must survive the encode/decode cycle unchanged")
+                .isEqualTo(authorName);
+    }
+
+    // =========================================================================
+    // testEncodeDecode_TextNodeCommit
+    //
+    // A TextNode is encoded as a SHAPE_COMMIT payload and decoded back.
+    //
+    // Asserts:
+    //   (a) the decoded MessageType is SHAPE_COMMIT
+    //   (b) the raw JSON payload contains a "content" field equal to "Hello World"
+    //   (c) decodePayload reconstructs a runtime TextNode instance
+    //       (Gson 2.10+ deserialises records via the canonical constructor)
+    //   (d) all value fields — content, color, clientId — survive unchanged
+    // =========================================================================
+
+    @Test
+    void testEncodeDecode_TextNodeCommit() {
+        // --- arrange ----------------------------------------------------------
+        UUID   shapeId   = UUID.fromString("fedcba98-7654-3210-fedc-ba9876543210");
+        String content   = "Hello World";
+        String color     = "#CABF69";
+        String clientId  = "client-text-001";
+
+        TextNode textNode = new TextNode(
+                shapeId,
+                1_800_000_000_000L,
+                color,
+                120.0, 240.0,
+                content,
+                "Arial", 16, false, false,
+                "TestAuthor", clientId);
+
+        // --- act: encode TextNode as a SHAPE_COMMIT frame ---------------------
+        // SHAPE_COMMIT is used to verify that MessageCodec can transport a
+        // TextNode payload correctly regardless of the frame-type discriminator.
+        ByteBuffer encoded   = MessageCodec.encodeObject(MessageType.SHAPE_COMMIT, textNode);
+        Message    decodedMsg = MessageCodec.decode(encoded);
+
+        // --- assert: frame type -----------------------------------------------
+        assertThat(decodedMsg.type())
+                .as("frame type must be SHAPE_COMMIT")
+                .isEqualTo(MessageType.SHAPE_COMMIT);
+
+        // --- assert: 'content' field in raw JSON ------------------------------
+        JsonObject json = MessageCodec.gson().fromJson(decodedMsg.payload(), JsonObject.class);
+
+        assertThat(json.has("content"))
+                .as("JSON payload must carry the 'content' field of a TextNode")
+                .isTrue();
+
+        assertThat(json.get("content").getAsString())
+                .as("'content' must be exactly \"Hello World\" — no truncation or encoding artefacts")
+                .isEqualTo(content);
+
+        // --- assert: deserialized instance is TextNode -----------------------
+        // Gson 2.10+ deserialises Java records through their canonical constructor,
+        // so decodePayload correctly produces a live TextNode with validated fields.
+        TextNode reconstructed = MessageCodec.decodePayload(decodedMsg, TextNode.class);
+
+        assertThat(reconstructed)
+                .as("decodePayload must return an instance of TextNode, not a generic Object")
+                .isInstanceOf(TextNode.class);
+
+        assertThat(reconstructed.content())
+                .as("TextNode.content() must survive the full encode → wire → decode cycle unchanged")
+                .isEqualTo(content);
+
+        assertThat(reconstructed.color())
+                .as("TextNode.color() must survive the encode/decode cycle unchanged")
+                .isEqualTo(color);
+
+        assertThat(reconstructed.clientId())
+                .as("TextNode.clientId() must survive the encode/decode cycle unchanged")
+                .isEqualTo(clientId);
+    }
+
+    // =========================================================================
+    // NEW — testEncodeDecode_ClearUserShapes
+    //
+    // CLEAR_USER_SHAPES carries a JSON-string payload containing the clientId
+    // of the user requesting the scoped clear.
+    //
+    // Asserts:
+    //   (a) the decoded MessageType is CLEAR_USER_SHAPES (wire byte 0x08)
+    //   (b) the clientId round-trips unchanged through encode → decode
+    //   (c) the frame is exactly HEADER_BYTES + len(JSON string) bytes
+    //   (d) the buffer is fully consumed after a single decode
+    // =========================================================================
+
+    @Test
+    void testEncodeDecode_ClearUserShapes() {
+        // --- arrange ----------------------------------------------------------
+        String clientId = "User-A-123";
+
+        // --- act --------------------------------------------------------------
+        ByteBuffer encoded = MessageCodec.encodeClearUserShapes(clientId);
+        int frameSize      = encoded.remaining();
+        Message decoded    = MessageCodec.decode(encoded);
+
+        // --- assert: wire type ------------------------------------------------
+        assertThat(decoded.type())
+                .as("decoded type must be CLEAR_USER_SHAPES (wire byte 0x08)")
+                .isEqualTo(MessageType.CLEAR_USER_SHAPES);
+
+        // --- assert: clientId round-trips through the dedicated helper --------
+        String decodedClientId = MessageCodec.decodeClearUserShapes(decoded);
+        assertThat(decodedClientId)
+                .as("clientId must survive the encode/decode cycle unchanged")
+                .isEqualTo(clientId);
+
+        // --- assert: frame sizing ---------------------------------------------
+        // The payload is a JSON string literal, e.g. "\"user-42\""
+        String jsonPayload    = MessageCodec.gson().toJson(clientId);
+        int expectedFrameSize = MessageCodec.HEADER_BYTES + jsonPayload.getBytes().length;
+        assertThat(frameSize)
+                .as("total CLEAR_USER_SHAPES frame must be exactly %d bytes", expectedFrameSize)
+                .isEqualTo(expectedFrameSize);
+
+        // --- assert: buffer fully consumed after one decode -------------------
+        assertThat(encoded.hasRemaining())
+                .as("buffer must be fully consumed — no leftover bytes after decoding a complete frame")
+                .isFalse();
     }
 
     // =========================================================================

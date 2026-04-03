@@ -1,10 +1,13 @@
 package com.distrisync.client;
 
-import javafx.scene.canvas.Canvas;
-import javafx.scene.canvas.GraphicsContext;
+import javafx.animation.FadeTransition;
+import javafx.application.Platform;
+import javafx.scene.Group;
+import javafx.scene.control.Label;
+import javafx.scene.layout.Pane;
 import javafx.scene.paint.Color;
-import javafx.scene.text.Font;
-import javafx.scene.text.FontWeight;
+import javafx.scene.shape.Circle;
+import javafx.util.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -16,8 +19,9 @@ import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -29,83 +33,103 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <h2>Send path</h2>
  * A {@link ScheduledExecutorService} fires every {@value #SEND_INTERVAL_MS} ms.
  * If the mouse has moved since the last tick the tracker encodes a
- * {@code UDP_POINTER|<clientId>|<x>|<y>} datagram and sends it to the
- * configured multicast group.  The dirty flag is cleared on each send cycle,
- * so static cursors produce zero traffic.
+ * {@code UDP_POINTER|<clientId>|<x>|<y>} datagram and multicasts it.
+ * The dirty flag is cleared on each tick so static cursors generate zero traffic.
  *
  * <h2>Receive path</h2>
  * A dedicated daemon thread blocks on {@link MulticastSocket#receive} with a
- * {@value #RECEIVE_TIMEOUT_MS} ms socket timeout so it can check the
- * {@code running} flag and exit cleanly on shutdown.  Each valid packet updates
- * the {@link CursorState} for the originating client ID.
+ * {@value #RECEIVE_TIMEOUT_MS} ms timeout so it can honour the {@code running}
+ * flag on shutdown.  Every valid packet is handed to the FX Application Thread
+ * via {@link Platform#runLater} — <em>no JavaFX node is ever touched from the
+ * receive thread</em>.
  *
  * <h2>Cursor rendering</h2>
- * {@link #renderCursors} is called from the JavaFX {@code AnimationTimer} on
- * the Application Thread — no locking is required.  Each cursor is rendered as
- * a semi-transparent filled circle with a contrasting label showing the
- * short client ID.  Opacity fades linearly from
- * {@value #FADE_START_MS} ms to {@value #CURSOR_TIMEOUT_MS} ms after the last
- * received packet; cursors older than {@value #CURSOR_TIMEOUT_MS} ms are
- * removed from the map.
+ * Remote cursors are rendered as JavaFX {@link Group} nodes (a coloured
+ * {@link Circle} + a {@link Label} badge) added to a transparent overlay
+ * {@link Pane}.  Positions are updated by relocating the Group via
+ * {@code setLayoutX/Y} — all on the FX thread.
+ *
+ * <h2>Fade-out / cleanup</h2>
+ * A periodic cleanup task (dispatched via {@code Platform.runLater} every
+ * {@value #CLEANUP_INTERVAL_MS} ms) checks whether any peer's last packet is
+ * older than {@value #CURSOR_TIMEOUT_MS} ms and, if so, plays a
+ * {@link FadeTransition} before removing the node.  A new packet for the same
+ * peer cancels any in-progress fade.
  *
  * <h2>Graceful degradation</h2>
- * If multicast is unavailable (e.g., restricted corporate networks, VPNs) the
- * tracker logs a warning and disables itself — the rest of the application
- * continues to function normally.
+ * If multicast is unavailable the tracker logs a warning and disables itself;
+ * the rest of the application continues normally.
  */
 public final class UdpPointerTracker {
 
     private static final Logger log = LoggerFactory.getLogger(UdpPointerTracker.class);
 
     // ── network config ────────────────────────────────────────────────────────
-    /** Administratively-scoped multicast group (RFC 2365). */
-    private static final String MULTICAST_GROUP  = "239.255.42.42";
-    private static final int    MULTICAST_PORT   = 9292;
+    private static final String MULTICAST_GROUP    = "239.255.42.42";
+    private static final int    MULTICAST_PORT     = 9292;
     private static final int    RECEIVE_TIMEOUT_MS = 200;
 
     // ── timing ────────────────────────────────────────────────────────────────
-    /** How often we broadcast our position when the mouse is moving. */
-    private static final long SEND_INTERVAL_MS  = 50;
-    /** Cursor starts fading after this many ms without a packet. */
-    private static final long FADE_START_MS     = 300;
-    /** Cursor is fully removed after this many ms without a packet. */
-    private static final long CURSOR_TIMEOUT_MS = 500;
+    private static final long SEND_INTERVAL_MS    = 50;
+    private static final long CURSOR_TIMEOUT_MS   = 500;
+    private static final long FADE_DURATION_MS    = 250;
+    private static final long CLEANUP_INTERVAL_MS = 100;
 
     // ── wire protocol ─────────────────────────────────────────────────────────
     private static final String MAGIC = "UDP_POINTER";
 
     // ── identity ──────────────────────────────────────────────────────────────
-    /** Short 8-character prefix of a random UUID — unique enough for display. */
     private final String clientId = UUID.randomUUID().toString().substring(0, 8);
 
-    // ── mutable mouse position (written from FX thread, read from send thread) ──
+    /**
+     * Human-readable display name shown in remote cursor badges.
+     * Set via {@link #setAuthorName(String)} before calling {@link #start()}.
+     * Included in every outgoing datagram so peers can display the real name.
+     */
+    private volatile String authorName = "";
+
+    // ── mouse position (written from FX thread, read from send scheduler) ─────
     private volatile double mouseX;
     private volatile double mouseY;
-    /** Set when the mouse moves; cleared on each send tick. */
     private final AtomicBoolean moved = new AtomicBoolean(false);
 
-    // ── remote cursor state ───────────────────────────────────────────────────
-    private final ConcurrentHashMap<String, CursorState> remoteCursors = new ConcurrentHashMap<>();
+    // ── cursor nodes — only ever accessed on the FX Application Thread ────────
+    private final Map<String, CursorEntry> cursors = new HashMap<>();
+
+    // ── UI overlay ────────────────────────────────────────────────────────────
+    private final Pane cursorPane;
 
     // ── networking ────────────────────────────────────────────────────────────
     private MulticastSocket          socket;
     private InetAddress              groupAddress;
     private NetworkInterface         networkInterface;
     private ScheduledExecutorService sendScheduler;
+    private ScheduledExecutorService cleanupScheduler;
     private Thread                   receiveThread;
 
     private volatile boolean running;
-
-    // ── canvas reference (used to clamp cursor coords to canvas bounds) ───────
-    @SuppressWarnings("unused")
-    private final Canvas canvas;
 
     // =========================================================================
     // Construction
     // =========================================================================
 
-    public UdpPointerTracker(Canvas canvas) {
-        this.canvas = canvas;
+    /**
+     * @param cursorPane the transparent overlay {@link Pane} that sits on top
+     *                   of the canvas stack; cursor nodes are added to / removed
+     *                   from this pane exclusively on the FX Application Thread
+     */
+    public UdpPointerTracker(Pane cursorPane) {
+        this.cursorPane = cursorPane;
+    }
+
+    /**
+     * Sets the human-readable display name broadcast in every UDP datagram and
+     * displayed in remote cursor badges.  Call before {@link #start()}.
+     *
+     * @param authorName the display name; {@code null} is treated as empty string
+     */
+    public void setAuthorName(String authorName) {
+        this.authorName = authorName != null ? authorName : "";
     }
 
     // =========================================================================
@@ -114,8 +138,9 @@ public final class UdpPointerTracker {
 
     /**
      * Opens the multicast socket, joins the group, and starts the send
-     * scheduler and receive thread.  Failures are logged and silently ignored
-     * so the application can run without pointer presence.
+     * scheduler, receive thread, and cursor-cleanup scheduler.
+     * Failures are logged and silently absorbed so the app can run without
+     * peer-presence support.
      */
     public void start() {
         running = true;
@@ -126,22 +151,26 @@ public final class UdpPointerTracker {
             socket = new MulticastSocket(MULTICAST_PORT);
             socket.setReuseAddress(true);
             socket.setSoTimeout(RECEIVE_TIMEOUT_MS);
-            // Prevent our own packets from looping back and appearing as a remote cursor
-            socket.setLoopbackMode(true);
+            // false = ENABLE loopback so packets sent on this machine are received
+            // by the same socket (required for localhost testing).
+            // Own-packet filtering is done via the clientId check in handleIncomingPacket.
+            socket.setLoopbackMode(false);
 
             if (networkInterface != null) {
-                socket.joinGroup(new InetSocketAddress(groupAddress, MULTICAST_PORT), networkInterface);
-                log.info("UdpPointerTracker joined multicast group {}:{} via {}",
+                socket.joinGroup(
+                        new InetSocketAddress(groupAddress, MULTICAST_PORT),
+                        networkInterface);
+                log.info("UdpPointerTracker joined {}:{} via {}",
                         MULTICAST_GROUP, MULTICAST_PORT, networkInterface.getName());
             } else {
-                // Fallback — let the OS pick an interface (less reliable, but better than nothing)
                 socket.joinGroup(groupAddress);
-                log.info("UdpPointerTracker joined multicast group {}:{} (OS-selected interface)",
+                log.info("UdpPointerTracker joined {}:{} (OS-selected interface)",
                         MULTICAST_GROUP, MULTICAST_PORT);
             }
 
             startSendScheduler();
             startReceiveThread();
+            startCleanupScheduler();
 
             log.info("UdpPointerTracker ready (clientId={})", clientId);
 
@@ -153,20 +182,22 @@ public final class UdpPointerTracker {
     }
 
     /**
-     * Cancels the send scheduler, closes the socket, and interrupts the
-     * receive thread.  Safe to call from any thread, including the FX thread.
+     * Cancels all background threads, closes the socket, and removes all
+     * cursor nodes from the pane on the FX thread.
+     * Safe to call from any thread.
      */
     public void stop() {
         running = false;
 
-        if (sendScheduler != null) {
-            sendScheduler.shutdownNow();
-        }
+        if (sendScheduler    != null) sendScheduler.shutdownNow();
+        if (cleanupScheduler != null) cleanupScheduler.shutdownNow();
 
         if (socket != null && !socket.isClosed()) {
             try {
                 if (networkInterface != null && groupAddress != null) {
-                    socket.leaveGroup(new InetSocketAddress(groupAddress, MULTICAST_PORT), networkInterface);
+                    socket.leaveGroup(
+                            new InetSocketAddress(groupAddress, MULTICAST_PORT),
+                            networkInterface);
                 } else if (groupAddress != null) {
                     socket.leaveGroup(groupAddress);
                 }
@@ -174,47 +205,27 @@ public final class UdpPointerTracker {
             socket.close();
         }
 
+        // Remove all cursor nodes on the FX thread
+        Platform.runLater(() -> {
+            cursorPane.getChildren().clear();
+            cursors.clear();
+        });
+
         log.debug("UdpPointerTracker stopped");
     }
 
     // =========================================================================
-    // Mouse position sink  (called from FX Application Thread)
+    // Mouse position sink  (FX Application Thread)
     // =========================================================================
 
     /**
-     * Records the current mouse position and marks it as changed.
-     * Called by {@link WhiteboardApp} on every {@code mouseMoved} /
-     * {@code mouseDragged} event — this method must be cheap.
+     * Records the latest mouse position and marks it as dirty.
+     * Must be cheap — called on every {@code mouseMoved} / {@code mouseDragged}.
      */
     public void onMouseMoved(double x, double y) {
         mouseX = x;
         mouseY = y;
         moved.set(true);
-    }
-
-    // =========================================================================
-    // Rendering  (called from FX Application Thread inside AnimationTimer)
-    // =========================================================================
-
-    /**
-     * Renders all known remote cursors onto the supplied {@link GraphicsContext}.
-     * Must be called exclusively from the JavaFX Application Thread.
-     *
-     * <p>Expired cursors (last seen more than {@value #CURSOR_TIMEOUT_MS} ms ago)
-     * are evicted lazily during this call to avoid a separate cleanup thread.
-     */
-    public void renderCursors(GraphicsContext gc) {
-        long now = System.currentTimeMillis();
-
-        remoteCursors.values().removeIf(c -> now - c.lastSeen > CURSOR_TIMEOUT_MS + 300L);
-
-        for (CursorState cursor : remoteCursors.values()) {
-            long elapsed = now - cursor.lastSeen;
-            if (elapsed >= CURSOR_TIMEOUT_MS) continue;
-
-            double opacity = computeOpacity(elapsed);
-            renderSingleCursor(gc, cursor, opacity);
-        }
     }
 
     // =========================================================================
@@ -229,16 +240,9 @@ public final class UdpPointerTracker {
         });
         sendScheduler.scheduleAtFixedRate(
                 this::maybeBroadcastPointer,
-                SEND_INTERVAL_MS, SEND_INTERVAL_MS, TimeUnit.MILLISECONDS
-        );
+                SEND_INTERVAL_MS, SEND_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * Sends a {@code UDP_POINTER} datagram if the mouse has moved since the
-     * last tick.  Skips the tick entirely if the socket is unavailable or if
-     * no movement was recorded — keeping the network completely silent for
-     * idle clients.
-     */
     private void maybeBroadcastPointer() {
         if (!moved.getAndSet(false)) return;
         if (socket == null || socket.isClosed()) return;
@@ -247,7 +251,9 @@ public final class UdpPointerTracker {
         double y = mouseY;
 
         try {
-            String payload = MAGIC + "|" + clientId + "|" + x + "|" + y;
+            // Wire format: UDP_POINTER|<clientId>|<x>|<y>|<authorName>
+            // authorName may be empty but the field separator is always present.
+            String payload = MAGIC + "|" + clientId + "|" + x + "|" + y + "|" + authorName;
             byte[] data    = payload.getBytes(StandardCharsets.UTF_8);
             DatagramPacket pkt = new DatagramPacket(data, data.length, groupAddress, MULTICAST_PORT);
             socket.send(pkt);
@@ -275,9 +281,9 @@ public final class UdpPointerTracker {
                 pkt.setLength(buf.length);
                 socket.receive(pkt);
                 String msg = new String(buf, 0, pkt.getLength(), StandardCharsets.UTF_8);
-                parseAndUpdateCursor(msg);
+                handleIncomingPacket(msg);
             } catch (SocketTimeoutException ignored) {
-                // Expected — lets us re-check the running flag
+                // Expected — used as a running-flag poll interval
             } catch (Exception e) {
                 if (running) log.trace("UDP receive error: {}", e.getMessage());
             }
@@ -285,80 +291,155 @@ public final class UdpPointerTracker {
     }
 
     /**
-     * Parses a {@code UDP_POINTER|<id>|<x>|<y>} message and upserts the
-     * remote cursor map.  Own packets are silently discarded.
+     * Parses a {@code UDP_POINTER|<id>|<x>|<y>|<authorName>} datagram.
+     * The {@code authorName} field (5th token) is optional for backward
+     * compatibility with older clients that send only 4 tokens.
+     * Own packets (loopback) are discarded.  All UI mutations are dispatched
+     * to the FX Application Thread via {@link Platform#runLater}.
      */
-    private void parseAndUpdateCursor(String msg) {
-        String[] parts = msg.split("\\|", 4);
-        if (parts.length != 4 || !MAGIC.equals(parts[0])) return;
+    private void handleIncomingPacket(String msg) {
+        // Split into at most 5 parts; authorName may itself contain no pipes.
+        String[] parts = msg.split("\\|", 5);
+        if (parts.length < 4 || !MAGIC.equals(parts[0])) return;
 
-        String senderId = parts[1];
-        if (clientId.equals(senderId)) return;   // echo of our own packet
+        String senderId   = parts[1];
+        if (clientId.equals(senderId)) return;
+
+        String peerName = parts.length >= 5 ? parts[4] : senderId;
+        if (peerName.isBlank()) peerName = senderId;
+
+        final String resolvedName = peerName;
+        log.trace("UDP pointer from '{}' ({})", resolvedName, senderId);
 
         try {
             double x = Double.parseDouble(parts[2]);
             double y = Double.parseDouble(parts[3]);
 
-            remoteCursors.compute(senderId, (id, existing) -> {
-                if (existing == null) existing = new CursorState(id);
-                existing.x        = x;
-                existing.y        = y;
-                existing.lastSeen = System.currentTimeMillis();
-                return existing;
-            });
+            Platform.runLater(() -> updateCursor(senderId, resolvedName, x, y));
+
         } catch (NumberFormatException e) {
             log.debug("Malformed UDP_POINTER packet ignored: {}", msg);
         }
     }
 
     // =========================================================================
-    // Cursor rendering helpers
+    // Cursor node management  (FX Application Thread only)
     // =========================================================================
 
-    private void renderSingleCursor(GraphicsContext gc, CursorState cursor, double opacity) {
-        gc.save();
-        gc.setGlobalAlpha(opacity);
+    /**
+     * Creates or updates the cursor node for the given peer, cancelling any
+     * in-progress fade-out so the peer appears immediately at its new position.
+     *
+     * @param peerId      stable short client-ID (used as the map key)
+     * @param displayName human-readable name shown in the badge; falls back to
+     *                    {@code peerId} for legacy peers
+     * @param x           canvas X coordinate
+     * @param y           canvas Y coordinate
+     */
+    private void updateCursor(String peerId, String displayName, double x, double y) {
+        CursorEntry entry = cursors.get(peerId);
 
-        Color fill   = Color.web(cursor.fillHex,   0.45);
-        Color stroke = Color.web(cursor.strokeHex, 0.90);
+        if (entry == null) {
+            // First packet from this peer — create a new cursor node.
+            Group node = buildCursorNode(peerId, displayName);
+            node.setLayoutX(x);
+            node.setLayoutY(y);
+            entry = new CursorEntry(peerId, node);
+            cursors.put(peerId, entry);
+            cursorPane.getChildren().add(node);
+        } else {
+            // Cancel any active fade so the cursor snaps back to full opacity.
+            if (entry.fadingOut && entry.activeFade != null) {
+                entry.activeFade.stop();
+                entry.activeFade = null;
+                entry.node.setOpacity(1.0);
+            }
+            entry.fadingOut = false;
+            entry.node.setLayoutX(x);
+            entry.node.setLayoutY(y);
+        }
 
-        // ── cursor circle ─────────────────────────────────────────────────────
-        gc.setFill(fill);
-        gc.fillOval(cursor.x - 9, cursor.y - 9, 18, 18);
-
-        gc.setStroke(stroke);
-        gc.setLineWidth(1.5);
-        gc.strokeOval(cursor.x - 9, cursor.y - 9, 18, 18);
-
-        // ── crosshair dot ─────────────────────────────────────────────────────
-        gc.setFill(stroke);
-        gc.fillOval(cursor.x - 2, cursor.y - 2, 4, 4);
-
-        // ── label ─────────────────────────────────────────────────────────────
-        gc.setFont(Font.font("System", FontWeight.BOLD, 10));
-
-        // Subtle shadow
-        gc.setFill(Color.rgb(0, 0, 0, 0.55));
-        gc.fillText(cursor.id, cursor.x + 12, cursor.y);
-
-        gc.setFill(Color.WHITE);
-        gc.fillText(cursor.id, cursor.x + 11, cursor.y - 1);
-
-        gc.restore();
+        entry.lastSeen = System.currentTimeMillis();
     }
 
     /**
-     * Returns an opacity value in [0, 1]:
-     * <ul>
-     *   <li>1.0 while {@code elapsed} < {@value #FADE_START_MS}</li>
-     *   <li>Linear ramp from 1.0 → 0.0 between {@value #FADE_START_MS}
-     *       and {@value #CURSOR_TIMEOUT_MS}</li>
-     * </ul>
+     * Builds a {@link Group} containing a coloured dot and a name badge for
+     * the given peer.  Colours are deterministically derived from the peer's
+     * client-ID hash so they remain stable across packets.
+     *
+     * @param peerId      stable short client-ID (used for colour derivation)
+     * @param displayName human-readable label shown in the badge
      */
-    private static double computeOpacity(long elapsed) {
-        if (elapsed <= FADE_START_MS) return 1.0;
-        double t = (double) (elapsed - FADE_START_MS) / (CURSOR_TIMEOUT_MS - FADE_START_MS);
-        return Math.max(0.0, 1.0 - t);
+    private Group buildCursorNode(String peerId, String displayName) {
+        int hash = peerId.hashCode();
+        int r    = clampBright((hash >> 16) & 0xFF);
+        int g    = clampBright((hash >>  8) & 0xFF);
+        int b    = clampBright( hash        & 0xFF);
+
+        Color fill   = Color.rgb(r, g, b, 0.55);
+        Color stroke = Color.rgb((int)(r * 0.75), (int)(g * 0.75), (int)(b * 0.75), 0.90);
+
+        Circle dot = new Circle(9, fill);
+        dot.setStroke(stroke);
+        dot.setStrokeWidth(1.5);
+
+        Label badge = new Label(displayName);
+        badge.setLayoutX(13);
+        badge.setLayoutY(-8);
+        badge.setStyle(
+            "-fx-text-fill: white; -fx-font-size: 10px; -fx-font-weight: bold;" +
+            "-fx-background-color: rgba(0,0,0,0.55); -fx-background-radius: 3;" +
+            "-fx-padding: 1 4;");
+
+        return new Group(dot, badge);
+    }
+
+    /** Keeps colour channel values visible on a white canvas: range [80, 200]. */
+    private static int clampBright(int v) {
+        return 80 + (v % 121);
+    }
+
+    // =========================================================================
+    // Cleanup scheduler  (background thread → Platform.runLater)
+    // =========================================================================
+
+    private void startCleanupScheduler() {
+        cleanupScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "udp-cursor-cleanup");
+            t.setDaemon(true);
+            return t;
+        });
+        // Dispatch the actual check to the FX thread so we never touch nodes
+        // from a background thread.
+        cleanupScheduler.scheduleAtFixedRate(
+                () -> Platform.runLater(this::expireOldCursors),
+                CLEANUP_INTERVAL_MS, CLEANUP_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Checks every tracked cursor for inactivity.  Must run on the FX thread.
+     * If a peer has not sent a packet in more than {@value #CURSOR_TIMEOUT_MS} ms,
+     * a {@link FadeTransition} is played; on completion the node is removed.
+     */
+    private void expireOldCursors() {
+        long now = System.currentTimeMillis();
+
+        for (CursorEntry entry : cursors.values()) {
+            if (entry.fadingOut || now - entry.lastSeen <= CURSOR_TIMEOUT_MS) {
+                continue;
+            }
+
+            entry.fadingOut = true;
+            FadeTransition ft = new FadeTransition(Duration.millis(FADE_DURATION_MS), entry.node);
+            ft.setFromValue(1.0);
+            ft.setToValue(0.0);
+            ft.setOnFinished(ev -> {
+                cursorPane.getChildren().remove(entry.node);
+                cursors.remove(entry.clientId);
+            });
+            entry.activeFade = ft;
+            ft.play();
+        }
     }
 
     // =========================================================================
@@ -386,48 +467,27 @@ public final class UdpPointerTracker {
     // Accessors
     // =========================================================================
 
-    /** Returns the short client ID broadcast in every UDP_POINTER packet. */
+    /** Returns the short client ID broadcast in every {@code UDP_POINTER} packet. */
     public String getClientId() {
         return clientId;
     }
 
     // =========================================================================
-    // CursorState
+    // CursorEntry — per-peer mutable record (FX thread only)
     // =========================================================================
 
-    /** Mutable per-peer cursor record — all writes are from the receive thread,
-     *  all reads are from the FX Application Thread (rendering). */
-    private static final class CursorState {
+    private static final class CursorEntry {
 
-        final String id;
-        volatile double x;
-        volatile double y;
-        volatile long   lastSeen;
+        final String          clientId;
+        final Group           node;
+        long                  lastSeen;
+        boolean               fadingOut;
+        FadeTransition        activeFade;
 
-        /** Deterministic color derived from the client ID string hash. */
-        final String fillHex;
-        final String strokeHex;
-
-        CursorState(String id) {
-            this.id       = id;
+        CursorEntry(String clientId, Group node) {
+            this.clientId = clientId;
+            this.node     = node;
             this.lastSeen = System.currentTimeMillis();
-
-            int hash = id.hashCode();
-            // Bias toward mid-to-high brightness so cursors are visible on white canvas
-            int r = clampBright((hash >> 16) & 0xFF);
-            int g = clampBright((hash >>  8) & 0xFF);
-            int b = clampBright( hash        & 0xFF);
-
-            this.fillHex   = String.format("#%02X%02X%02X", r, g, b);
-            // Slightly darker stroke for contrast
-            this.strokeHex = String.format("#%02X%02X%02X",
-                (int)(r * 0.75), (int)(g * 0.75), (int)(b * 0.75));
-        }
-
-        /** Ensures the channel value is visible on a white background. */
-        private static int clampBright(int v) {
-            // Keep values in [80, 200] — vivid but not washed-out
-            return 80 + (v % 121);
         }
     }
 }

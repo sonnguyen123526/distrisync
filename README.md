@@ -1,200 +1,167 @@
-<div align="center">
+# DistriSync — Distributed Collaborative Whiteboard
 
-# DistriSync
+**Authors:** Harrison Nguyen & Son Nguyen
 
-**A distributed real-time collaborative whiteboard built on a dual-protocol TCP NIO + UDP multicast architecture.**
-
-[![Java](https://img.shields.io/badge/Java-21-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)](https://openjdk.org/projects/jdk/21/)
-[![Maven](https://img.shields.io/badge/Maven-3.8%2B-C71A36?style=for-the-badge&logo=apachemaven&logoColor=white)](https://maven.apache.org/)
-[![JavaFX](https://img.shields.io/badge/JavaFX-21.0.4-2C8EBB?style=for-the-badge&logo=java&logoColor=white)](https://openjfx.io/)
-[![License](https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge)](LICENSE)
-[![Course](https://img.shields.io/badge/COMP_352-Course_Project-7c3aed?style=for-the-badge)](Technical_Report.pdf)
-
-*Authors: Harrison Nguyen · Son Nguyen*
-
-</div>
+![Java](https://img.shields.io/badge/Java-21-007396?logo=openjdk&logoColor=white)
+![JavaFX](https://img.shields.io/badge/JavaFX-21.0.4-blue?logo=java&logoColor=white)
+![Maven](https://img.shields.io/badge/Maven-3.x-C71A36?logo=apachemaven&logoColor=white)
+![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
 ## Project Overview
 
-DistriSync is a multi-client, real-time collaborative whiteboard that lets peers draw and annotate simultaneously on a shared canvas. It uses a **dual-protocol network architecture** to separate concerns between reliable state synchronization and low-latency presence:
+DistriSync is a peer-class distributed collaborative whiteboard built entirely on a custom Java NIO server — no third-party real-time framework. The server runs a single-threaded `java.nio.channels.Selector` event loop that accepts connections, multiplexes reads and writes, and fans out shape mutations to all connected clients with zero blocking I/O on the hot path. Accepted `SocketChannel` instances are configured with `TCP_NODELAY = true` and 64 KiB socket buffers to minimise Nagle-induced latency, enabling sub-frame delivery of stroke data across a local network. A length-prefixed binary frame (1-byte type tag + 4-byte big-endian payload length + UTF-8 JSON body) with a 16 MiB hard ceiling governs every exchange between server and clients, providing deterministic parse complexity regardless of payload size.
 
-| Channel | Transport | Purpose |
-|---------|-----------|---------|
-| **Authoritative State** | TCP via Java NIO (`Selector`-based, non-blocking) | Shape mutations, full-board snapshots on connect, guaranteed ordered delivery |
-| **Ephemeral Presence** | UDP multicast (`239.255.42.42:9292`) | Live ghost-cursor positions broadcast at 50 ms intervals — zero TCP overhead |
-
-All TCP frames use a custom **5-byte binary header** (`1 byte type + 4 byte big-endian length`) followed by a UTF-8 JSON body, keeping the protocol lightweight while remaining human-debuggable. The server's NIO engine multiplexes all client sockets on a **single thread** via a `Selector` loop, with no thread-per-connection overhead.
+The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.css` design system — a flat, neutral-toned control panel with uniform spacing and hover states. A layered canvas architecture (base paint layer → remote transient layer → local transient layer → cursor overlay → control pane) ensures that in-progress strokes from remote peers are rendered live without flickering or compositing artefacts. A parallel UDP multicast channel (`239.255.42.42:9292`) carries ephemeral pointer positions at 20 Hz, giving all peers real-time cursor presence without touching the TCP state machine. Shared canvas authority is implemented via last-writer-wins using Lamport-ish per-shape timestamps enforced atomically inside a `ConcurrentHashMap`, so concurrent edits converge without a central lock.
 
 ---
 
-## Core Features
+## Core Features (Implemented)
 
-- **Concurrent State Sync** — A single-threaded Java NIO `Selector` loop multiplexes all connected clients. Incoming shape mutations are applied to the server's `ConcurrentHashMap` with **last-writer-wins** timestamp semantics, then immediately broadcast to every other peer.
-- **Vector Graphics** — Three first-class shape primitives are supported: `Line` (start/end coordinates, stroke width, colour), `Circle` (centre, radius, fill toggle, stroke width), and `TextNode` (content, font family, size, bold/italic). All are modelled as a sealed `Shape` interface and transmitted as typed JSON envelopes discriminated by a `"_type"` field.
-- **Live Ghost Cursors** — `UdpPointerTracker` multicasts each client's pointer position at ≤ 50 ms. Peers render coloured crosshair overlays (colour derived from a hash of the peer's ID) that **fade after 300 ms** and are evicted after **500 ms** of inactivity.
-- **Live Drag Previews** — Semi-transparent dashed preview shapes are rendered locally while the mouse button is held, providing instant visual feedback before a mutation is committed to the network.
-- **Full-Board Snapshot on Join** — On TCP connect, the server immediately delivers a `SNAPSHOT` frame containing the complete serialized canvas, so late-joining clients are instantly synchronized regardless of prior activity.
-- **Graceful Reconnection** — The client TCP layer performs up to **5 reconnect attempts** with a **2 s back-off**, re-sending a `HANDSHAKE` on each successful reconnect to restore session state.
+- **Custom Java NIO Server** — single-threaded `Selector` loop; non-blocking `SocketChannel` per client; write queue with `OP_WRITE` only when the send buffer saturates; `TCP_NODELAY` + 64 KiB `SO_SNDBUF`/`SO_RCVBUF` for low-latency streaming state.
 
----
+- **Binary Length-Prefixed Protocol** — `MessageCodec` frames every message as `[type: 1B][length: 4B big-endian][UTF-8 JSON payload]`; partial-read detection via `PartialMessageException` with buffer compaction; max payload 16 MiB.
 
-## System Architecture
+- **Sealed Shape Hierarchy** — `Shape` is a Java 21 sealed interface permitting `Line`, `Circle`, `EraserPath`, and `TextNode`; each record carries `objectId` (UUID), Lamport `timestamp`, `color`, `strokeWidth`, `authorName`, and `clientId`. Server-side `ShapeCodec` and a mirrored client `ClientShapeCodec` deserialise via a `"_type"` discriminator field with Gson.
 
-### Connection & Protocol Flow
+- **Live Collaborative Drawing (`SHAPE_START` / `SHAPE_UPDATE` / `SHAPE_COMMIT`)** — streaming stroke events are relayed to all peers by the server without persistence; the receiving client renders a `TransientShapeEntry` on the remote transient canvas layer, providing smooth live-ink preview before commit.
 
-```mermaid
-sequenceDiagram
-    participant C1 as Client A (JavaFX)
-    participant S  as NioServer (TCP 9090)
-    participant C2 as Client B (JavaFX)
-    participant MC as Multicast 239.255.42.42:9292
+- **MS Paint–Style Text Tool** — clicking the canvas in `TEXT` mode opens a floating `TextField` directly on the control pane. Keystrokes are throttled and transmitted as `TEXT_UPDATE` frames (~50 ms interval); peers render a ghost `VBox` with a live caret (`▏`) on their cursor pane. Pressing Enter commits a `TextNode` via `MUTATION` + `SHAPE_COMMIT`, which dismisses all ghost previews.
 
-    Note over C1,S: TCP Handshake and Snapshot
-    C1->>S: TCP CONNECT
-    C1->>S: HANDSHAKE [0x01 len=2 payload="{}"]
-    S-->>C1: SNAPSHOT  [0x02 len=N payload=JSON shape array]
+- **`BlendMode.ERASE` Vector Masking (Eraser Tool)** — each eraser gesture is committed as an `EraserPath` shape (parallel `double[] xs`, `ys` coordinate arrays, `strokeWidth = 3×` the stroke slider, square `StrokeLineCap`). The base canvas redraws all shapes sorted by timestamp; white eraser paths painted last visually erase earlier ink without destroying the underlying vector geometry. Live eraser strokes stream as `SHAPE_UPDATE` frames with tool `"ERASER"` for real-time peer preview.
 
-    Note over C1,C2: Mutation Propagation
-    C1->>S: MUTATION  [0x03 len=M payload=Line shape object]
-    S->>S: applyMutation() - last-writer-wins timestamp check
-    S-->>C2: MUTATION  [0x03 len=M payload=Line shape object]
-    Note right of S: broadcastExcept(sender)
+- **Scoped `CLEAR_USER_SHAPES`** — the "Clear Board" button sends a `CLEAR_USER_SHAPES` frame carrying only the issuing client's `clientId`. The server calls `CanvasStateManager.clearUserShapes(clientId)` and broadcasts the scoped clear to peers, who purge only that owner's shapes. No other client's work is affected.
 
-    Note over C1,MC: UDP Cursor Presence - 50 ms tick
-    loop every 50 ms if pointer moved
-        C1-)MC: UDP_POINTER|a1b2c3d4|412.0|308.5
-        MC-)C2: same datagram via multicast delivery
-        C2->>C2: renderCursors() - crosshair overlay with fade
-    end
-```
+- **Undo (`UNDO_REQUEST` / `SHAPE_DELETE`)** — the client sends an `UNDO_REQUEST`; the server calls `deleteShape` on the state manager and, on success, broadcasts a `SHAPE_DELETE` frame so all peers remove the shape atomically.
 
-### TCP Frame Format
+- **Figma-Style Live Attribution** — in-progress remote strokes display a floating author label rendered at the stroke tip from `TransientShapeEntry.authorName` (sourced from the `SHAPE_START` handshake). Committed shapes surface the author name in a hover tooltip via `findShapeAt` hit-testing + `ownerTooltip` overlay.
 
-```
- Byte offset →  0        1        2        3        4        5 … 5+len
-                ┌────────┬────────┬────────┬────────┬────────┬──────────────────┐
-                │  type  │         payload length (int32 big-endian)  │  payload  │
-                │ 1 byte │                  4 bytes                   │ len bytes │
-                └────────┴────────┴────────┴────────┴────────┴──────────────────┘
+- **UDP Multicast Cursor Presence** — `UdpPointerTracker` joins multicast group `239.255.42.42:9292`; pointer positions are transmitted at 20 Hz (only on mouse move). Each peer is represented by a deterministically coloured dot + name badge on a dedicated `cursorPane` with fade-out removal on timeout.
 
-  type values
-  ──────────────────────────────────────────────────────────────
-  0x01  HANDSHAKE    client greeting (payload: "{}")
-  0x02  SNAPSHOT     full board state (payload: JSON shape array)
-  0x03  MUTATION     incremental shape update (payload: JSON shape object)
-  0x04  UDP_POINTER  cursor presence — transmitted via UDP only; reserved on TCP
-```
+- **Last-Writer-Wins Convergence** — `CanvasStateManager` uses `ConcurrentHashMap.compute` with a strictly-greater-timestamp guard, so concurrent mutations from multiple peers converge without server-side locking or operational transforms.
 
-### UDP Cursor Datagram Format
-
-```
-  UDP_POINTER|<clientId>|<x>|<y>
-  ─────────────────────────────────────────────────────────────
-  clientId  first 8 chars of a random UUID (e.g. "a1b2c3d4")
-  x, y      double-precision floating-point canvas coordinates
-  encoding  UTF-8 plain text, pipe-delimited
-```
+- **Reconnect with Back-off** — `NetworkClient` reconnects automatically after EOF or I/O errors using a synchronised `reconnect()` cycle that re-executes the full `HANDSHAKE` → `SNAPSHOT` flow to restore canvas state.
 
 ---
 
-## Package Structure
+## Project Structure
 
 ```
 distrisync/
 ├── src/
-│   ├── main/java/com/distrisync/
-│   │   ├── client/
-│   │   │   ├── WhiteboardApp.java          # JavaFX Application entry point & render loop
-│   │   │   ├── WhiteboardClient.java       # Legacy CLI entry-point (delegates to App)
-│   │   │   ├── NetworkClient.java          # Blocking NIO TCP client (read + write daemon threads)
-│   │   │   ├── CanvasUpdateListener.java   # Callback interface for inbound mutations
-│   │   │   ├── UdpPointerTracker.java      # UDP multicast cursor send / receive / render
-│   │   │   ├── PointerStateManager.java    # In-memory cursor state registry + eviction
-│   │   │   └── PointerState.java           # Immutable cursor snapshot (id, x, y, timestamp)
-│   │   ├── server/
-│   │   │   ├── WhiteboardServer.java       # Server entry point & shutdown-hook lifecycle
-│   │   │   ├── NioServer.java              # Selector event loop, accept / read / broadcast
-│   │   │   ├── ClientSession.java          # Per-connection read buffer + write queue
-│   │   │   ├── CanvasStateManager.java     # Authoritative shape map, LWW merge logic
-│   │   │   └── ShapeCodec.java             # Server-side Gson shape serialization
-│   │   ├── protocol/
-│   │   │   ├── MessageType.java            # Wire-byte opcodes (0x01 – 0x04)
-│   │   │   ├── Message.java                # Immutable message record (type + JSON payload)
-│   │   │   ├── MessageCodec.java           # 5-byte framing encode / decode (HEADER_BYTES = 5)
-│   │   │   └── PartialMessageException.java
-│   │   └── model/
-│   │       ├── Shape.java                  # Sealed interface — permits Line, Circle, TextNode
-│   │       ├── Line.java
-│   │       ├── Circle.java
-│   │       └── TextNode.java
-│   └── test/java/com/distrisync/
-│       ├── integration/ClientServerIntegrationTest.java
-│       ├── client/PointerStateTrackerTest.java
-│       ├── server/CanvasStateManagerTest.java
-│       └── protocol/MessageCodecTest.java
+│   ├── main/
+│   │   ├── java/com/distrisync/
+│   │   │   ├── client/         # JavaFX UI, TCP client, UDP pointer tracker
+│   │   │   │   ├── WhiteboardApp.java
+│   │   │   │   ├── NetworkClient.java
+│   │   │   │   ├── UdpPointerTracker.java
+│   │   │   │   └── CanvasUpdateListener.java
+│   │   │   ├── server/         # NIO server, session management, canvas authority
+│   │   │   │   ├── WhiteboardServer.java
+│   │   │   │   ├── NioServer.java
+│   │   │   │   ├── CanvasStateManager.java
+│   │   │   │   ├── ClientSession.java
+│   │   │   │   └── ShapeCodec.java
+│   │   │   ├── protocol/       # Binary framing and message type registry
+│   │   │   │   ├── MessageCodec.java
+│   │   │   │   ├── MessageType.java
+│   │   │   │   └── Message.java
+│   │   │   └── model/          # Sealed shape hierarchy
+│   │   │       ├── Shape.java
+│   │   │       ├── Line.java
+│   │   │       ├── Circle.java
+│   │   │       ├── TextNode.java
+│   │   │       └── EraserPath.java
+│   │   └── resources/
+│   │       ├── styles.css
+│   │       └── logback.xml
+│   └── test/
+│       └── java/com/distrisync/
+│           ├── protocol/MessageCodecTest.java
+│           └── server/CanvasStateManagerTest.java
 └── pom.xml
 ```
 
 ---
 
+## Wire Protocol Reference
+
+| `MessageType` | Byte | Direction | Description |
+|---|---|---|---|
+| `HANDSHAKE` | `0x01` | C → S | Client identification (`clientId`, `authorName`) |
+| `SNAPSHOT` | `0x02` | S → C | Full canvas state on connect / reconnect |
+| `MUTATION` | `0x03` | C ↔ S | Committed shape add/update; broadcast to peers |
+| `UDP_POINTER` | `0x04` | UDP only | Ephemeral cursor position (multicast, not TCP) |
+| `SHAPE_START` | `0x05` | C ↔ S | Begin live stroke; relayed, not persisted |
+| `SHAPE_UPDATE` | `0x06` | C ↔ S | Incremental stroke points; relayed, not persisted |
+| `SHAPE_COMMIT` | `0x07` | C ↔ S | Finalise live stroke; peer dismisses transient layer |
+| `CLEAR_USER_SHAPES` | `0x08` | C ↔ S | Remove all shapes owned by a specific `clientId` |
+| `UNDO_REQUEST` | `0x09` | C → S | Request last-shape deletion |
+| `SHAPE_DELETE` | `0x0A` | S → C | Broadcast shape removal after undo |
+| `TEXT_UPDATE` | `0x0B` | C ↔ S | Live text ghost preview; relayed, not persisted |
+
+---
+
 ## Prerequisites
 
-| Requirement | Minimum Version | Verify with |
-|-------------|-----------------|-------------|
-| JDK | **21** | `java -version` |
-| Apache Maven | **3.8+** | `mvn -version` |
+| Requirement | Minimum Version |
+|---|---|
+| JDK | 21 |
+| Apache Maven | 3.8+ |
+| Network | Server and clients on the same subnet (UDP multicast) |
 
-> **Windows path check:** Ensure `JAVA_HOME` points to your JDK 21 installation and `%JAVA_HOME%\bin` appears on your `PATH` before running any commands below.
+> **Note:** Ensure `JAVA_HOME` points to a JDK 21 installation and `mvn` is on your `PATH` before proceeding.
 
 ---
 
-## Build
+## Build & Execution
 
-Compile sources and package the artifact (skipping tests for a fast build):
+### 1. Build the Project
 
-```powershell
-mvn clean install -DskipTests
-```
-
-To compile **and** run the full test suite (unit + integration):
+Run once from the repository root to compile sources and execute all unit tests:
 
 ```powershell
-mvn clean verify
+mvn clean install
 ```
 
 ---
 
-## Running the Application
+### 2. Start the Server
 
-### Step 1 — Start the Server
+The server binds on TCP port **9090** by default. An optional positional argument overrides the port.
 
-The NIO server binds to **TCP port `9090`** by default. An optional positional argument selects a different port.
+**Default port (9090):**
 
 ```powershell
-# Default port (9090)
-mvn exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer"
-
-# Custom port example
-mvn exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer" "-Dexec.args=8080"
+mvn exec:java -Dexec.mainClass=com.distrisync.server.WhiteboardServer
 ```
 
-A successful start prints a line similar to:
+**Custom port (e.g., 8080):**
+
+```powershell
+mvn exec:java -Dexec.mainClass=com.distrisync.server.WhiteboardServer -Dexec.args="8080"
+```
+
+**Alternatively, run the assembled JAR directly:**
+
+```powershell
+java -cp target/distrisync-0.1.0-SNAPSHOT.jar com.distrisync.server.WhiteboardServer
+```
+
+Expected console output on successful bind:
 
 ```
-INFO  NioServer - Listening on port 9090
+INFO  NioServer - Server listening on port 9090
 ```
-
-Leave this terminal running for the lifetime of the session.
 
 ---
 
-### Step 2 — Start the Client(s)
+### 3. Start a Client
 
-> **Two or more client instances are required to observe real-time collaboration.** Open a separate PowerShell window for each client.
+Each client instance is an independent JavaFX process. Launch as many as needed; all instances connecting to the same server address will share the canvas in real time.
 
-**Connect to `localhost` on the default port:**
+**Connect to localhost (default host/port):**
 
 ```powershell
 mvn javafx:run
@@ -203,25 +170,29 @@ mvn javafx:run
 **Connect to a specific host and port:**
 
 ```powershell
-mvn javafx:run "-Djavafx.args=192.168.1.10 9090"
+mvn javafx:run "-Djavafx.args=192.168.1.100 9090"
 ```
 
-Repeat the above command in a second (and third, etc.) terminal window. Each client window receives an immediate full-board snapshot and will display remote peers' ghost cursors as they move their mouse.
+> Open multiple terminals and run `mvn javafx:run` in each to simulate multiple collaborating peers locally.
 
 ---
 
-## Course Documentation
+### 4. Run Tests Only
 
-> Detailed architectural decisions, custom binary protocol byte-structure rationale, concurrency model analysis, conflict-resolution strategy, and generative AI usage reflections are documented in the accompanying formal report:
->
-> **[`Technical_Report.pdf`](Technical_Report.pdf)**
->
-> This document satisfies the COMP 352 written deliverable requirement and should be read alongside the source code for full context on design trade-offs and protocol specification.
+```powershell
+mvn test
+```
 
 ---
 
-<div align="center">
+## Future Roadmap
 
-*COMP 352 — Distributed Systems · Harrison Nguyen & Son Nguyen*
+- **Session Multiplexing (Rooms)** — partition the server into isolated named rooms so that concurrent sessions operate on independent canvas state. Each room would maintain its own `CanvasStateManager` instance and broadcast domain; clients select or create a room during the handshake phase.
 
-</div>
+- **UDP Ephemeral Screen Broadcasting** — extend `UdpPointerTracker` to carry compressed partial-canvas frames, enabling a low-latency screen-sharing overlay for observers who require pixel-accurate presentation view without round-tripping through the TCP mutation log.
+
+---
+
+## License
+
+This project is released under the [MIT License](LICENSE).
