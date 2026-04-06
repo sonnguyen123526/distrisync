@@ -4,8 +4,8 @@ import com.distrisync.client.CanvasUpdateListener;
 import com.distrisync.client.NetworkClient;
 import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
-import com.distrisync.server.CanvasStateManager;
 import com.distrisync.server.NioServer;
+import com.distrisync.server.RoomManager;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,10 +51,10 @@ class ClientServerIntegrationTest {
     // Server-side fixtures
     // =========================================================================
 
-    private CanvasStateManager stateManager;
-    private NioServer          server;
-    private Thread             serverThread;
-    private int                serverPort;
+    private RoomManager roomManager;
+    private NioServer   server;
+    private Thread      serverThread;
+    private int         serverPort;
 
     // =========================================================================
     // Client-side fixtures
@@ -77,8 +77,8 @@ class ClientServerIntegrationTest {
     @BeforeEach
     void setUp() throws Exception {
         // --- Server -----------------------------------------------------------
-        stateManager = new CanvasStateManager();
-        server       = new NioServer(0 /* ephemeral */, stateManager);
+        roomManager = new RoomManager();
+        server      = new NioServer(0 /* ephemeral */, roomManager);
 
         serverThread = new Thread(server, "test-nio-server");
         serverThread.setDaemon(true);
@@ -174,7 +174,8 @@ class ClientServerIntegrationTest {
         // Assert: server state
         // =====================================================================
 
-        List<Shape> serverSnapshot = stateManager.snapshot();
+        // All test clients join the default "Global" room (NetworkClient default).
+        List<Shape> serverSnapshot = roomManager.getRoomSnapshot("Global");
 
         assertThat(serverSnapshot)
                 .as("server must hold exactly the one mutated shape")
@@ -248,8 +249,7 @@ class ClientServerIntegrationTest {
      *       clients are fully connected before the test body runs.</li>
      *   <li>{@link #state} — a running canvas state map keyed by
      *       {@link Shape#objectId()}, updated by both SNAPSHOT and MUTATION
-     *       events.  MUTATION events follow last-writer-wins semantics,
-     *       matching the server's {@link CanvasStateManager} behaviour.</li>
+     *       events.  MUTATION events follow last-writer-wins semantics.</li>
      *   <li>{@link #mutationsReceived} — append-only ordered list of every
      *       MUTATION shape received; useful for failure diagnosis.</li>
      * </ul>

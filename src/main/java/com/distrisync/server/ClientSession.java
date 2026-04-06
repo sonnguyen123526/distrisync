@@ -40,6 +40,13 @@ final class ClientSession {
     volatile String clientId = "";
 
     /**
+     * Room identifier supplied in the {@code HANDSHAKE} frame.
+     * Determines which {@link RoomContext} this session is routed to.
+     * Remains empty until the first valid HANDSHAKE is processed.
+     */
+    volatile String roomId = "";
+
+    /**
      * Accumulation buffer for inbound bytes.
      * 64 KiB covers any realistic single MUTATION frame; the server never
      * receives SNAPSHOT messages (only sends them).

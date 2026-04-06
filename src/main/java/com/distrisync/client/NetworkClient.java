@@ -97,6 +97,7 @@ public final class NetworkClient implements AutoCloseable {
     private final int    port;
     private final String authorName;
     private final String clientId;
+    private final String roomId;
 
     /** Thread-safe listener registry; copy-on-write for lock-free iteration. */
     private final CopyOnWriteArrayList<CanvasUpdateListener> listeners =
@@ -131,20 +132,21 @@ public final class NetworkClient implements AutoCloseable {
 
     /**
      * Creates an anonymous {@code NetworkClient} targeting the given server endpoint.
-     * Attribution fields default to empty string / random UUID.
+     * Attribution and room fields default to empty / random UUID / "Global".
      * Call {@link #connect()} to establish the connection.
      *
      * @param host server host name or IP; must not be blank
      * @param port server TCP port; must be in [1, 65535]
      */
     public NetworkClient(String host, int port) {
-        this(host, port, "", java.util.UUID.randomUUID().toString());
+        this(host, port, "", java.util.UUID.randomUUID().toString(), "Global");
     }
 
     /**
      * Creates an attributed {@code NetworkClient} targeting the given server endpoint.
      * The {@code authorName} and {@code clientId} are embedded in the {@code HANDSHAKE}
-     * frame and attached to every shape the client mutates.
+     * frame and attached to every shape the client mutates.  The client joins the
+     * {@code "Global"} room.
      *
      * @param host       server host name or IP; must not be blank
      * @param port       server TCP port; must be in [1, 65535]
@@ -152,6 +154,20 @@ public final class NetworkClient implements AutoCloseable {
      * @param clientId   stable session identifier; may be empty but not {@code null}
      */
     public NetworkClient(String host, int port, String authorName, String clientId) {
+        this(host, port, authorName, clientId, "Global");
+    }
+
+    /**
+     * Creates a fully attributed {@code NetworkClient} that joins the specified room.
+     *
+     * @param host       server host name or IP; must not be blank
+     * @param port       server TCP port; must be in [1, 65535]
+     * @param authorName human-readable display name; may be empty but not {@code null}
+     * @param clientId   stable session identifier; may be empty but not {@code null}
+     * @param roomId     the collaborative room to join; defaults to {@code "Global"}
+     *                   if {@code null} or blank
+     */
+    public NetworkClient(String host, int port, String authorName, String clientId, String roomId) {
         if (host == null || host.isBlank())
             throw new IllegalArgumentException("host must not be blank");
         if (port < 1 || port > 65_535)
@@ -160,6 +176,8 @@ public final class NetworkClient implements AutoCloseable {
         this.port       = port;
         this.authorName = authorName != null ? authorName : "";
         this.clientId   = clientId   != null ? clientId   : "";
+        String rid      = roomId != null ? roomId.strip() : "";
+        this.roomId     = rid.isBlank() ? "Global" : rid;
     }
 
     // =========================================================================
@@ -424,12 +442,12 @@ public final class NetworkClient implements AutoCloseable {
      * after a reconnect), so no locking is required here.
      */
     private void sendHandshake() throws IOException {
-        record HandshakePayload(String authorName, String clientId) {}
+        record HandshakePayload(String authorName, String clientId, String roomId) {}
         ByteBuffer handshake = MessageCodec.encodeObject(
-                MessageType.HANDSHAKE, new HandshakePayload(authorName, clientId));
+                MessageType.HANDSHAKE, new HandshakePayload(authorName, clientId, roomId));
         writeBlocking(channel, handshake);
-        log.debug("HANDSHAKE sent to {}:{} authorName='{}' clientId='{}'",
-                host, port, authorName, clientId);
+        log.debug("HANDSHAKE sent to {}:{} authorName='{}' clientId='{}' roomId='{}'",
+                host, port, authorName, clientId, roomId);
     }
 
     /**

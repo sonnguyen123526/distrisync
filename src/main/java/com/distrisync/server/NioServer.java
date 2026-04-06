@@ -28,41 +28,42 @@ import java.util.concurrent.CompletableFuture;
  * Central-authority server for the DistriSync collaborative whiteboard.
  *
  * <h2>Architecture</h2>
- * A single-threaded NIO event loop driven by a {@link Selector}. The design
- * supports many concurrent clients (the requirement is ≥ 4) without spawning
- * additional threads and without any blocking I/O call inside the loop.
+ * A single-threaded NIO event loop driven by a {@link Selector}.  All client
+ * connections share the same selector; room-level isolation is enforced
+ * entirely in software via the {@link RoomManager} routing layer.
  *
- * <h2>Connection lifecycle</h2>
+ * <h2>Multi-tenant connection lifecycle</h2>
  * <ol>
  *   <li><b>Accept</b> – a new {@link SocketChannel} is registered for
  *       {@code OP_READ} with a fresh {@link ClientSession} as the attachment.
- *       A {@code SNAPSHOT} of all current canvas shapes is immediately
- *       enqueued and flushed.</li>
- *   <li><b>Read</b> – incoming bytes are appended to the session's
- *       accumulation buffer. Complete frames are decoded in a tight loop;
- *       partial tails are left in the buffer for the next read event.</li>
- *   <li><b>Mutation handling</b> – a decoded {@code MUTATION} frame is passed
- *       to {@link CanvasStateManager#applyMutation}. If the state manager
- *       accepts it (newer timestamp wins), the <em>exact same encoded frame</em>
- *       is broadcast to every other connected client.</li>
- *   <li><b>Write</b> – {@code OP_WRITE} is armed only when a previous write was
- *       partial (TCP send-buffer full). The event loop drains the write queue
- *       on the next writable wake-up and then clears the interest bit.</li>
- *   <li><b>Disconnect</b> – EOF or any I/O error cancels the key and closes
- *       the channel cleanly.</li>
+ *       <em>No snapshot is sent yet</em>; the server waits for a HANDSHAKE
+ *       to learn which room the client wants to join.</li>
+ *   <li><b>HANDSHAKE</b> – the first frame from a connected client must be a
+ *       {@code HANDSHAKE} carrying {@code authorName}, {@code clientId}, and
+ *       the new {@code roomId}.  The server registers the key in the
+ *       matching {@link RoomContext} (creating one if necessary) and sends
+ *       that room's {@code SNAPSHOT} to the new client only.</li>
+ *   <li><b>Read / mutation</b> – subsequent frames are dispatched to the
+ *       room identified by {@code session.roomId}.  Mutations go through
+ *       the room's own {@link CanvasStateManager} and are broadcast only to
+ *       other clients in the <em>same room</em>.</li>
+ *   <li><b>Write</b> – {@code OP_WRITE} is armed only when a previous write
+ *       was partial (TCP send-buffer full).</li>
+ *   <li><b>Disconnect</b> – the key is removed from its room's active-key
+ *       set before the channel is closed.</li>
  * </ol>
  *
  * <h2>Thread safety</h2>
- * {@code NioServer} itself is single-threaded. {@link CanvasStateManager}
- * uses a {@link java.util.concurrent.ConcurrentHashMap} and may safely be
- * called from other threads (e.g. an admin console) without coordination.
+ * {@code NioServer} itself is single-threaded.  {@link CanvasStateManager}
+ * and {@link RoomManager} use {@link java.util.concurrent.ConcurrentHashMap}
+ * and may safely be called from other threads without coordination.
  */
 public final class NioServer implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(NioServer.class);
 
     private final int port;
-    private final CanvasStateManager stateManager;
+    private final RoomManager roomManager;
 
     /**
      * Completes with the actual TCP port the server bound to.  Useful when
@@ -84,14 +85,14 @@ public final class NioServer implements Runnable {
     private volatile Selector selector;
 
     /**
-     * @param port         TCP port to bind; must be in the range [1, 65535]
-     * @param stateManager the canvas state authority
+     * @param port        TCP port to bind; must be in the range [0, 65535]
+     * @param roomManager the multi-tenant routing registry
      */
-    public NioServer(int port, CanvasStateManager stateManager) {
+    public NioServer(int port, RoomManager roomManager) {
         if (port < 0 || port > 65535) throw new IllegalArgumentException("Invalid port: " + port);
-        if (stateManager == null)      throw new IllegalArgumentException("stateManager must not be null");
-        this.port         = port;
-        this.stateManager = stateManager;
+        if (roomManager == null)       throw new IllegalArgumentException("roomManager must not be null");
+        this.port        = port;
+        this.roomManager = roomManager;
     }
 
     // =========================================================================
@@ -109,22 +110,18 @@ public final class NioServer implements Runnable {
         try (ServerSocketChannel serverChannel = ServerSocketChannel.open();
              Selector selector = Selector.open()) {
 
-            // Store selector reference before entering the loop so stop() can
-            // call wakeup() even if this thread is blocked inside select().
             this.selector = selector;
 
             serverChannel.configureBlocking(false);
             serverChannel.bind(new InetSocketAddress(port));
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
-            // Resolve the ephemeral port (works for both port==0 and fixed ports).
             int actualPort = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
             boundPortFuture.complete(actualPort);
 
             log.info("NioServer listening — port={} minConcurrentClients=4", actualPort);
 
             while (!stopped && !Thread.currentThread().isInterrupted()) {
-                // Blocks until at least one channel becomes ready.
                 int readyCount = selector.select();
                 if (readyCount == 0) {
                     continue;
@@ -144,8 +141,6 @@ public final class NioServer implements Runnable {
 
         } catch (IOException e) {
             log.error("NioServer fatal I/O error — shutting down", e);
-            // Fail the future so callers blocked on getBoundPortFuture().get() surface
-            // the real cause rather than hanging until their timeout fires.
             boundPortFuture.completeExceptionally(e);
         }
 
@@ -165,7 +160,6 @@ public final class NioServer implements Runnable {
             if (key.isReadable()) {
                 handleRead(key, selector);
             }
-            // Re-check validity: handleRead may have cancelled the key on disconnect.
             if (key.isValid() && key.isWritable()) {
                 handleWrite(key);
             }
@@ -176,32 +170,28 @@ public final class NioServer implements Runnable {
     // Accept
     // =========================================================================
 
+    /**
+     * Registers the new channel for reads and attaches a fresh
+     * {@link ClientSession}.  <em>No snapshot is sent here</em>; the client
+     * must send a {@code HANDSHAKE} first so the server knows which room to
+     * join it to.
+     */
     private void handleAccept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
         SocketChannel clientChannel = serverChannel.accept();
         if (clientChannel == null) {
-            // Spurious wake-up; the OS withdrew the connection before we accepted.
             return;
         }
 
         clientChannel.configureBlocking(false);
-        // Disable Nagle's algorithm so small frames (cursor updates, text events)
-        // are sent immediately without waiting for ACKs or buffer fill.
         clientChannel.setOption(StandardSocketOptions.TCP_NODELAY, true);
-        // Ensure kernel socket buffers are at least 64 KiB each to absorb
-        // burst traffic without stalling the event loop.
         clientChannel.setOption(StandardSocketOptions.SO_SNDBUF, 64 * 1024);
         clientChannel.setOption(StandardSocketOptions.SO_RCVBUF, 64 * 1024);
 
         ClientSession session = new ClientSession();
         clientChannel.register(selector, SelectionKey.OP_READ, session);
 
-        log.info("Client connected  session={} remote={}",
+        log.info("Client connected  session={} remote={} — awaiting HANDSHAKE",
                 session.sessionId, clientChannel.getRemoteAddress());
-
-        sendSnapshot(session, selector.keys().stream()
-                .filter(k -> k.attachment() == session)
-                .findFirst()
-                .orElseThrow());
     }
 
     // =========================================================================
@@ -233,7 +223,6 @@ public final class NioServer implements Runnable {
 
         log.debug("Read {} bytes from session={}", bytesRead, session.sessionId);
 
-        // Flip to read-mode and drain all complete frames.
         session.readBuffer.flip();
         try {
             while (session.readBuffer.hasRemaining()) {
@@ -241,19 +230,16 @@ public final class NioServer implements Runnable {
                 try {
                     msg = MessageCodec.decode(session.readBuffer);
                 } catch (PartialMessageException e) {
-                    // Incomplete frame — wait for more bytes.
                     log.debug("Partial frame session={} bytesNeeded={}",
                             session.sessionId, e.getBytesNeeded());
                     break;
                 }
                 processMessage(msg, key, selector);
                 if (!key.isValid()) {
-                    // processMessage may have closed this key on protocol error.
                     return;
                 }
             }
         } finally {
-            // Move unprocessed bytes to the front of the buffer and switch back to write-mode.
             session.readBuffer.compact();
         }
     }
@@ -267,8 +253,6 @@ public final class NioServer implements Runnable {
 
         switch (msg.type()) {
             case HANDSHAKE -> {
-                // Extract authorName and clientId so subsequent shape mutations can
-                // be correlated with the originating user in server logs.
                 try {
                     JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
                     if (p.has("authorName") && !p.get("authorName").isJsonNull()) {
@@ -277,14 +261,30 @@ public final class NioServer implements Runnable {
                     if (p.has("clientId") && !p.get("clientId").isJsonNull()) {
                         session.clientId = p.get("clientId").getAsString();
                     }
+                    if (p.has("roomId") && !p.get("roomId").isJsonNull()) {
+                        String rid = p.get("roomId").getAsString().strip();
+                        session.roomId = rid.isBlank() ? "Global" : rid;
+                    } else {
+                        session.roomId = "Global";
+                    }
                 } catch (Exception ignored) {
-                    // Malformed handshake payload — keep defaults
+                    session.roomId = "Global";
                 }
-                log.info("HANDSHAKE session={} authorName='{}' clientId='{}'",
-                        session.sessionId, session.authorName, session.clientId);
+
+                // Register this key with the room and send the room's snapshot.
+                RoomContext room = roomManager.getOrCreateRoom(session.roomId);
+                room.addKey(senderKey);
+
+                log.info("HANDSHAKE session={} authorName='{}' clientId='{}' roomId='{}'",
+                        session.sessionId, session.authorName, session.clientId, session.roomId);
+
+                sendSnapshot(session, senderKey, room);
             }
 
             case MUTATION -> {
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+
                 Shape shape;
                 try {
                     shape = ShapeCodec.decodeMutation(msg.payload());
@@ -294,39 +294,44 @@ public final class NioServer implements Runnable {
                     return;
                 }
 
-                boolean applied = stateManager.applyMutation(shape);
+                boolean applied = room.stateManager.applyMutation(shape);
 
                 if (applied) {
-                    log.info("MUTATION accepted  type={} id={} ts={} author='{}' from={}",
+                    log.info("MUTATION accepted  type={} id={} ts={} author='{}' room='{}' from={}",
                             shape.getClass().getSimpleName(), shape.objectId(),
-                            shape.timestamp(), shape.authorName(), session.sessionId);
+                            shape.timestamp(), shape.authorName(), session.roomId, session.sessionId);
+
+                    // Persist to WAL before broadcasting so the record survives a crash
+                    // between the apply and the broadcast.
+                    roomManager.appendToWal(session.roomId, msg);
 
                     ByteBuffer frame = MessageCodec.encode(msg);
-                    broadcastExcept(frame, senderKey, selector);
+                    broadcastToRoom(session.roomId, frame, senderKey);
                 } else {
                     log.debug("MUTATION rejected (stale)  id={} from={}", shape.objectId(), session.sessionId);
                 }
             }
 
-            // Ephemeral live-drawing events — relay to all other clients without
-            // touching the canvas state manager (these frames are never persisted).
             case SHAPE_START, SHAPE_UPDATE, SHAPE_COMMIT -> {
-                log.debug("{} relayed from session={}", msg.type(), session.sessionId);
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+                log.debug("{} relayed  room='{}' from session={}", msg.type(), session.roomId, session.sessionId);
                 ByteBuffer frame = MessageCodec.encode(msg);
-                broadcastExcept(frame, senderKey, selector);
+                broadcastToRoom(session.roomId, frame, senderKey);
             }
 
-            // Ephemeral live-typing event — relay immediately to all other clients.
-            // TEXT_UPDATE frames are transient: they carry in-progress (uncommitted)
-            // text and must NOT be written to the persistent shapeMap.  The final
-            // committed TextNode arrives as a normal MUTATION once the user confirms.
             case TEXT_UPDATE -> {
-                log.debug("TEXT_UPDATE relayed from session={}", session.sessionId);
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+                log.debug("TEXT_UPDATE relayed  room='{}' from session={}", session.roomId, session.sessionId);
                 ByteBuffer frame = MessageCodec.encode(msg);
-                broadcastExcept(frame, senderKey, selector);
+                broadcastToRoom(session.roomId, frame, senderKey);
             }
 
             case CLEAR_USER_SHAPES -> {
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+
                 String targetClientId;
                 try {
                     targetClientId = MessageCodec.decodeClearUserShapes(msg);
@@ -334,17 +339,21 @@ public final class NioServer implements Runnable {
                     log.warn("Malformed CLEAR_USER_SHAPES payload from session={}: {}", session.sessionId, e.getMessage());
                     return;
                 }
-                stateManager.clearUserShapes(targetClientId);
-                log.info("CLEAR_USER_SHAPES from session={} targetClientId='{}'",
-                        session.sessionId, targetClientId);
-                // Broadcast the exact same scoped-clear frame so all peers remove
-                // only the shapes belonging to that clientId from their local view.
+                room.stateManager.clearUserShapes(targetClientId);
+                log.info("CLEAR_USER_SHAPES  room='{}' from session={} targetClientId='{}'",
+                        session.roomId, session.sessionId, targetClientId);
+
+                // Persist to WAL so the per-user purge survives a restart.
+                roomManager.appendToWal(session.roomId, msg);
+
                 ByteBuffer frame = MessageCodec.encodeClearUserShapes(targetClientId);
-                broadcastExcept(frame, senderKey, selector);
+                broadcastToRoom(session.roomId, frame, senderKey);
             }
 
             case UNDO_REQUEST -> {
-                // Payload: { "shapeId": "<uuid-string>" }
+                RoomContext room = resolveRoom(session, senderKey);
+                if (room == null) return;
+
                 UUID shapeId;
                 try {
                     JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
@@ -354,15 +363,21 @@ public final class NioServer implements Runnable {
                     return;
                 }
 
-                boolean deleted = stateManager.deleteShape(shapeId);
+                boolean deleted = room.stateManager.deleteShape(shapeId);
                 if (deleted) {
-                    log.info("UNDO_REQUEST accepted  shapeId={} author='{}' session={}",
-                            shapeId, session.authorName, session.sessionId);
-                    // Notify all OTHER clients to remove the shape from their canvas.
+                    log.info("UNDO_REQUEST accepted  shapeId={} room='{}' author='{}' session={}",
+                            shapeId, session.roomId, session.authorName, session.sessionId);
                     record ShapeDeletePayload(String shapeId) {}
-                    ByteBuffer frame = MessageCodec.encodeObject(
-                            MessageType.SHAPE_DELETE, new ShapeDeletePayload(shapeId.toString()));
-                    broadcastExcept(frame, senderKey, selector);
+                    var deletePayload = new ShapeDeletePayload(shapeId.toString());
+                    Message deleteMsg = new Message(
+                            MessageType.SHAPE_DELETE, MessageCodec.gson().toJson(deletePayload));
+
+                    // Persist the SHAPE_DELETE outcome (not the UNDO_REQUEST trigger) so
+                    // recovery can apply a clean deleteShape() without re-evaluating intent.
+                    roomManager.appendToWal(session.roomId, deleteMsg);
+
+                    ByteBuffer frame = MessageCodec.encode(deleteMsg);
+                    broadcastToRoom(session.roomId, frame, senderKey);
                 } else {
                     log.debug("UNDO_REQUEST no-op (shape not found)  shapeId={} session={}",
                             shapeId, session.sessionId);
@@ -374,52 +389,78 @@ public final class NioServer implements Runnable {
         }
     }
 
+    /**
+     * Resolves the {@link RoomContext} for the given session.  Logs a warning
+     * and returns {@code null} if the session has not yet completed its
+     * HANDSHAKE (i.e. {@code roomId} is still blank).
+     */
+    private RoomContext resolveRoom(ClientSession session, SelectionKey key) {
+        if (session.roomId.isBlank()) {
+            log.warn("Message received before HANDSHAKE from session={} — ignoring", session.sessionId);
+            return null;
+        }
+        RoomContext room = roomManager.getRoom(session.roomId);
+        if (room == null) {
+            log.warn("Unknown roomId='{}' for session={} — ignoring", session.roomId, session.sessionId);
+            return null;
+        }
+        return room;
+    }
+
     // =========================================================================
     // Snapshot delivery
     // =========================================================================
 
     /**
-     * Encodes the current canvas state as a {@code SNAPSHOT} frame and enqueues
-     * it for delivery to the newly connected session.
+     * Encodes the room's current canvas state as a {@code SNAPSHOT} frame and
+     * enqueues it for delivery to the newly joined session.
      */
-    private void sendSnapshot(ClientSession session, SelectionKey key) {
-        List<Shape> shapes = stateManager.snapshot();
+    private void sendSnapshot(ClientSession session, SelectionKey key, RoomContext room) {
+        List<Shape> shapes = room.stateManager.snapshot();
         String payload = ShapeCodec.encodeSnapshot(shapes);
         Message snapshotMsg = new Message(MessageType.SNAPSHOT, payload);
         ByteBuffer frame = MessageCodec.encode(snapshotMsg);
 
-        log.info("Sending SNAPSHOT  shapes={} bytes={} to={}",
-                shapes.size(), frame.remaining(), session.sessionId);
+        log.info("Sending SNAPSHOT  room='{}' shapes={} bytes={} to={}",
+                room.roomId, shapes.size(), frame.remaining(), session.sessionId);
 
         session.enqueue(frame);
         flushWriteQueue(session, key);
     }
 
     // =========================================================================
-    // Broadcast
+    // Room-scoped broadcast
     // =========================================================================
 
     /**
-     * Delivers a frame to all registered client channels <em>except</em> the
-     * sender's key.
+     * Delivers {@code frame} to every active client in {@code roomId}
+     * <em>except</em> the sender.
      *
-     * <p>To avoid a {@link java.util.ConcurrentModificationException} if a failed
-     * write triggers a key cancellation, keys that error during broadcast are
-     * collected and closed <em>after</em> the iteration completes.
+     * <p>Only keys registered in that specific {@link RoomContext} are
+     * considered; clients in other rooms never see this frame.  Keys that
+     * fail during the write are collected and closed after the iteration
+     * to avoid a {@link java.util.ConcurrentModificationException}.
+     *
+     * @param roomId    the target room identifier
+     * @param frame     the encoded binary frame to deliver (read-mode)
+     * @param senderKey the originating client's key; excluded from delivery
      */
-    private void broadcastExcept(ByteBuffer frame, SelectionKey senderKey, Selector selector) {
+    private void broadcastToRoom(String roomId, ByteBuffer frame, SelectionKey senderKey) {
+        RoomContext room = roomManager.getRoom(roomId);
+        if (room == null) {
+            log.warn("broadcastToRoom called for unknown roomId='{}'", roomId);
+            return;
+        }
+
         List<SelectionKey> toClose = new ArrayList<>();
         int recipientCount = 0;
 
-        for (SelectionKey key : selector.keys()) {
-            if (!(key.channel() instanceof SocketChannel)
-                    || !key.isValid()
-                    || key == senderKey) {
+        for (SelectionKey key : room.getActiveKeys()) {
+            if (!key.isValid() || key == senderKey) {
                 continue;
             }
 
             ClientSession session = (ClientSession) key.attachment();
-            // enqueue() makes an independent copy — safe for multiple recipients.
             session.enqueue(frame);
 
             if (!flushWriteQueue(session, key)) {
@@ -429,7 +470,7 @@ public final class NioServer implements Runnable {
             }
         }
 
-        log.debug("Broadcast sent to {} client(s)", recipientCount);
+        log.debug("Room broadcast  roomId='{}' recipients={}", roomId, recipientCount);
         toClose.forEach(this::closeKey);
     }
 
@@ -447,12 +488,6 @@ public final class NioServer implements Runnable {
     /**
      * Attempts to drain the session's write queue into the socket's send buffer.
      *
-     * <ul>
-     *   <li>If the queue is fully drained, {@code OP_WRITE} is cleared.</li>
-     *   <li>If the send buffer becomes full mid-write, {@code OP_WRITE} is armed
-     *       so the event loop resumes on the next writable wake-up.</li>
-     * </ul>
-     *
      * @return {@code true} on success; {@code false} if an {@link IOException}
      *         occurred (caller should close the key)
      */
@@ -465,7 +500,6 @@ public final class NioServer implements Runnable {
                 channel.write(buf);
 
                 if (buf.hasRemaining()) {
-                    // TCP send-buffer is full — arm OP_WRITE and come back later.
                     key.interestOpsOr(SelectionKey.OP_WRITE);
                     log.debug("Write queue stalled (send-buffer full) session={}", session.sessionId);
                     return true;
@@ -474,7 +508,6 @@ public final class NioServer implements Runnable {
                 session.writeQueue.poll();
             }
 
-            // Queue drained — remove OP_WRITE so we don't spin.
             key.interestOpsAnd(~SelectionKey.OP_WRITE);
             return true;
 
@@ -490,17 +523,23 @@ public final class NioServer implements Runnable {
 
     private void closeKey(SelectionKey key) {
         Object attachment = key.attachment();
-        String sessionDesc = attachment instanceof ClientSession s
-                ? "session=" + s.sessionId
-                : "server-channel";
 
-        log.info("Closing channel  {}", sessionDesc);
+        if (attachment instanceof ClientSession s) {
+            // Remove from the room's active-key set before cancelling the key.
+            if (!s.roomId.isBlank()) {
+                roomManager.removeClientFromRoom(s.roomId, key);
+            }
+            log.info("Closing channel  session={} room='{}'", s.sessionId, s.roomId);
+        } else {
+            log.info("Closing server channel");
+        }
+
         key.cancel();
 
         try {
             key.channel().close();
         } catch (IOException e) {
-            log.warn("Error closing channel {}: {}", sessionDesc, e.getMessage());
+            log.warn("Error closing channel: {}", e.getMessage());
         }
     }
 
@@ -508,37 +547,26 @@ public final class NioServer implements Runnable {
     // Accessors
     // =========================================================================
 
-    /**
-     * The TCP port configured at construction time.  When {@code 0} was
-     * supplied the OS assigns an ephemeral port at bind-time; use
-     * {@link #getBoundPortFuture()} to obtain the actual port.
-     */
+    /** The TCP port configured at construction time. */
     public int getPort() {
         return port;
     }
 
-    /** The {@link CanvasStateManager} backing this server instance. */
-    public CanvasStateManager getStateManager() {
-        return stateManager;
+    /** The {@link RoomManager} backing this server instance. */
+    public RoomManager getRoomManager() {
+        return roomManager;
     }
 
     /**
      * Returns a {@link CompletableFuture} that completes with the actual TCP
-     * port the server bound to.  Callers should apply a reasonable timeout:
-     * <pre>{@code
-     * int port = server.getBoundPortFuture().get(3, TimeUnit.SECONDS);
-     * }</pre>
-     * The future completes exceptionally if the server fails to bind.
+     * port the server bound to.
      */
     public CompletableFuture<Integer> getBoundPortFuture() {
         return boundPortFuture;
     }
 
     /**
-     * Signals the event loop to exit gracefully.  Calling this from any
-     * thread is safe; it sets a flag and wakes the blocked {@link Selector}
-     * so the loop exits on its next iteration without relying on
-     * {@link Thread#interrupt()}.
+     * Signals the event loop to exit gracefully.  Safe to call from any thread.
      */
     public void stop() {
         stopped = true;

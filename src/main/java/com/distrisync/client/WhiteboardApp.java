@@ -136,9 +136,10 @@ public class WhiteboardApp extends Application {
     private NetworkClient     networkClient;
     private UdpPointerTracker udpTracker;
 
-    // ── user identity (captured at startup via name dialog) ───────────────────
+    // ── user identity and room (captured at startup via dialogs) ─────────────
     private String authorName = "Anonymous";
     private String clientId   = UUID.randomUUID().toString();
+    private String roomId     = "Global";
 
     /**
      * LIFO history of shape IDs committed by this local user during the current
@@ -189,7 +190,18 @@ public class WhiteboardApp extends Application {
         authorName = rawName.isBlank() ? "Anonymous" : rawName;
         clientId   = UUID.randomUUID().toString();
 
-        stage.setTitle("DistriSync – " + authorName);
+        // Prompt for the room to join before the network connection is opened
+        // so that the roomId is available when sendHandshake() is called.
+        TextInputDialog roomDialog = new TextInputDialog("Global");
+        roomDialog.setTitle("DistriSync – Room");
+        roomDialog.setHeaderText("Join a Collaborative Room");
+        roomDialog.setContentText("Room ID:");
+        roomDialog.getDialogPane().setStyle("-fx-background-color: #1e1e2e; -fx-font-size: 13px;");
+        Optional<String> roomResult = roomDialog.showAndWait();
+        String rawRoom = roomResult.orElse("Global").strip();
+        roomId = rawRoom.isBlank() ? "Global" : rawRoom;
+
+        stage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
 
         // ── Layer 1: base canvas ──────────────────────────────────────────────
         baseCanvas = new Canvas();
@@ -944,7 +956,7 @@ public class WhiteboardApp extends Application {
         String host = raw.size() > 0 ? raw.get(0) : DEFAULT_HOST;
         int    port = raw.size() > 1 ? parseInt(raw.get(1), DEFAULT_PORT) : DEFAULT_PORT;
 
-        networkClient = new NetworkClient(host, port, authorName, clientId);
+        networkClient = new NetworkClient(host, port, authorName, clientId, roomId);
 
         // Callbacks arrive on distrisync-read; marshal to FX thread before touching state
         networkClient.addListener(new CanvasUpdateListener() {
