@@ -1,5 +1,7 @@
 package com.distrisync.server;
 
+import com.distrisync.model.Circle;
+import com.distrisync.model.Shape;
 import com.distrisync.protocol.Message;
 import com.distrisync.protocol.MessageCodec;
 import com.distrisync.protocol.MessageType;
@@ -13,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.*;
 
@@ -47,6 +50,12 @@ import static org.assertj.core.api.Assertions.*;
  *       immediately with {@link IllegalArgumentException}.</li>
  *   <li>Double-close safety: calling {@link WalManager#close()} twice does
  *       not throw.</li>
+ *   <li>Compaction correctness: after {@link WalManager#compactWal} replaces a
+ *       bloated WAL (100 noise frames) with the minimal surviving-shape set
+ *       (1 {@code MUTATION} frame), the on-disk file is drastically smaller,
+ *       the temporary {@code .wal.tmp} file is cleaned up, and a fresh
+ *       {@link RoomContext} that replays the compacted WAL recovers exactly
+ *       the one surviving shape with lossless field equality.</li>
  * </ul>
  */
 class WalManagerTest {
@@ -590,6 +599,161 @@ class WalManagerTest {
                     .as("WalManager constructor must create the data directory (and any missing parents) " +
                         "automatically — operators must not need to pre-create it")
                     .isDirectory();
+        }
+    }
+
+    // =========================================================================
+    // testWalCompaction_ReducesFileSizeAndRetainsState
+    // =========================================================================
+
+    /**
+     * End-to-end correctness and size-reduction proof for
+     * {@link WalManager#compactWal}.
+     *
+     * <h2>Scenario</h2>
+     * <ol>
+     *   <li><b>Bloat phase</b> — 100 {@code SHAPE_COMMIT} frames are appended to the
+     *       WAL, simulating a long-lived room that has accumulated noise entries
+     *       that are no longer part of the authoritative canvas state.  After this
+     *       phase the WAL file must exceed 2 KB.</li>
+     *   <li><b>Compaction phase</b> — a {@link CanvasStateManager} with exactly
+     *       <em>one</em> surviving {@link Circle} shape (the last-writer-wins
+     *       in-memory truth) is constructed.  {@link WalManager#compactWal} is
+     *       invoked with the snapshot, which serialises the single shape as one
+     *       {@code MUTATION} frame, writes it to a temp file, and atomically
+     *       replaces the active WAL via
+     *       {@link java.nio.file.Files#move} + {@code ATOMIC_MOVE}.</li>
+     *   <li><b>Recovery phase</b> — a brand-new {@link WalManager} instance bound
+     *       to the same directory is handed to a fresh {@link RoomContext}
+     *       constructor, which replays the compacted WAL into an empty
+     *       {@link CanvasStateManager}.  The recovered state must contain exactly
+     *       the one surviving shape with lossless field equality.</li>
+     * </ol>
+     *
+     * <h2>Invariants asserted</h2>
+     * <ol>
+     *   <li><b>Pre-compaction size</b> — WAL exceeds 2 KB after 100 appended frames.
+     *       This proves the bloat phase actually created a meaningful file.</li>
+     *   <li><b>Size reduction ratio</b> — compacted file is at least 5× smaller
+     *       than the bloated file; in practice the ratio is ~14× (100 × 33-byte
+     *       frames → ~3 300 B, down to 1 × ~230-byte frame).</li>
+     *   <li><b>Absolute upper bound</b> — compacted file fits within 1 KiB,
+     *       confirming it is a single {@code MUTATION} frame, not the full old log.</li>
+     *   <li><b>Temp-file cleanup</b> — {@code {roomId}.wal.tmp} must not exist
+     *       after successful compaction; it was atomically renamed to {@code .wal}.</li>
+     *   <li><b>Shape count</b> — the compacted WAL replays into exactly 1 shape
+     *       in the recovered {@link CanvasStateManager}.</li>
+     *   <li><b>Shape identity</b> — the recovered shape carries the same
+     *       {@link Shape#objectId()} as the shape passed to {@code compactWal}.</li>
+     *   <li><b>Lamport timestamp fidelity</b> — the recovered shape retains the
+     *       exact {@link Shape#timestamp()} value, proving the MUTATION frame
+     *       encoded the full shape record without truncation.</li>
+     * </ol>
+     *
+     * <h2>Why {@code MUTATION} frames, not {@code SHAPE_COMMIT}</h2>
+     * The WAL recovery path in {@link RoomContext} only replays {@code MUTATION},
+     * {@code SHAPE_DELETE}, and {@code CLEAR_USER_SHAPES} frames.
+     * {@code SHAPE_COMMIT} frames would be silently skipped, leaving the canvas
+     * empty after a post-compaction restart.  This test implicitly verifies that
+     * {@link WalManager#compactWal} writes the correct frame type.
+     */
+    @Test
+    void testWalCompaction_ReducesFileSizeAndRetainsState() throws IOException {
+        final String ROOM = "CompactionRoom";
+
+        // The single shape that should survive after compaction.
+        UUID   survivingId    = UUID.fromString("cafecafe-cafe-cafe-cafe-cafecafecafe");
+        Circle survivingShape = new Circle(
+                survivingId, 9_000L, "#AA0000",
+                100.0, 200.0, 50.0, false, 2.0, "Alice", "client-1");
+
+        // ── Phase 1 & 2: Bloat → Compact — both within one WalManager lifetime ─
+        try (WalManager wal = new WalManager(tempDir)) {
+
+            // Bloat: append 100 SHAPE_COMMIT noise frames.
+            // Each frame is ~33 bytes (5-byte header + 28-byte payload), so
+            // the bloated file will be approximately 3 300 bytes.
+            for (int i = 1; i <= 100; i++) {
+                wal.append(ROOM, shapeCommit(i));
+            }
+
+            long bloatedSize = wal.walFileSize(ROOM);
+
+            // ── 1. Pre-compaction size guard ──────────────────────────────────
+            assertThat(bloatedSize)
+                    .as("pre-compaction WAL must exceed 2 KB after 100 appended SHAPE_COMMIT frames — " +
+                        "this guards against a vacuous compaction that starts from an empty file")
+                    .isGreaterThan(2_000L);
+
+            // Build the authoritative in-memory canvas: exactly one surviving shape.
+            CanvasStateManager canvas = new CanvasStateManager();
+            canvas.applyMutation(survivingShape);
+            List<Shape> snapshot = canvas.snapshot();
+
+            assertThat(snapshot)
+                    .as("pre-condition: the canvas must contain exactly 1 shape before compaction")
+                    .hasSize(1);
+
+            // Compact: replace the 100-frame WAL with a single MUTATION frame.
+            wal.compactWal(ROOM, snapshot);
+
+            long compactedSize = wal.walFileSize(ROOM);
+
+            // ── 2. Size-reduction ratio: at least 5× ─────────────────────────
+            assertThat(compactedSize)
+                    .as("compacted WAL must be at least 5× smaller than the bloated WAL " +
+                        "(expected ~14× reduction: 100 × 33-byte frames → 1 × ~230-byte frame)")
+                    .isLessThan(bloatedSize / 5L);
+
+            // ── 3. Absolute size upper bound: under 1 KiB ─────────────────────
+            assertThat(compactedSize)
+                    .as("compacted WAL for a single shape must fit comfortably within 1 KiB — " +
+                        "if it doesn't, compactWal wrote the old frames instead of the snapshot")
+                    .isLessThan(1_024L);
+
+            // ── 4. Temp file must have been cleaned up ────────────────────────
+            Path tmpFile = tempDir.resolve("CompactionRoom.wal.tmp");
+            assertThat(tmpFile)
+                    .as(".wal.tmp must not exist after successful compaction — " +
+                        "Files.move(ATOMIC_MOVE) must have renamed it to .wal")
+                    .doesNotExist();
+
+            // ── 5. Active .wal file must be a regular file ────────────────────
+            Path walFile = tempDir.resolve("CompactionRoom.wal");
+            assertThat(walFile)
+                    .as("compacted .wal file must exist as a regular file after compaction")
+                    .exists()
+                    .isRegularFile();
+        }
+
+        // ── Phase 3: Verify recovery — fresh WalManager + fresh RoomContext ───
+        //
+        // RoomContext's constructor calls WalManager.recover() and replays every
+        // MUTATION frame into a new CanvasStateManager.  After compaction the WAL
+        // contains exactly one MUTATION frame representing the surviving shape.
+        try (WalManager freshWal = new WalManager(tempDir)) {
+            RoomContext recovered = new RoomContext(ROOM, freshWal);
+
+            // ── 6. Shape count ─────────────────────────────────────────────────
+            assertThat(recovered.stateManager.size())
+                    .as("recovered CanvasStateManager must contain exactly 1 shape — " +
+                        "compaction must have written exactly one MUTATION frame (the surviving shape), " +
+                        "not the 100 stale SHAPE_COMMIT frames it replaced")
+                    .isEqualTo(1);
+
+            List<Shape> recoveredShapes = recovered.stateManager.snapshot();
+
+            // ── 7. Shape identity ──────────────────────────────────────────────
+            assertThat(recoveredShapes.get(0).objectId())
+                    .as("recovered shape must carry the same objectId as the surviving shape " +
+                        "passed to compactWal — the serialise→move→recover round-trip must be lossless")
+                    .isEqualTo(survivingId);
+
+            // ── 8. Lamport timestamp fidelity ──────────────────────────────────
+            assertThat(recoveredShapes.get(0).timestamp())
+                    .as("recovered shape must retain the exact Lamport timestamp (9000) from the original — " +
+                        "ShapeCodec.encodeMutation must not truncate or reset the timestamp field")
+                    .isEqualTo(9_000L);
         }
     }
 }

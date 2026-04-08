@@ -3,16 +3,27 @@ package com.distrisync.server;
 import com.distrisync.model.Circle;
 import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
+import com.distrisync.protocol.Message;
+import com.distrisync.protocol.MessageCodec;
+import com.distrisync.protocol.MessageCodec.LobbyRoomEntry;
+import com.distrisync.protocol.MessageType;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.nio.ByteBuffer;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,7 +46,12 @@ import static org.assertj.core.api.Assertions.*;
  * <h2>Package access</h2>
  * This test class lives in the {@code com.distrisync.server} package so it
  * can read the package-private {@link RoomContext} fields
- * ({@code stateManager}, {@code getActiveKeys()}) without reflection.
+ * ({@code stateManager}, {@code getActiveKeys()}) and call
+ * {@link RoomContext#touchActivity()} without reflection.
+ * Private fields ({@code lastActivityTimestamp}) and private methods
+ * ({@code StorageLifecycleManager.runCycle()}) that are needed by lifecycle
+ * tests are accessed via {@link java.lang.reflect.Field} /
+ * {@link java.lang.reflect.Method}.
  */
 class RoomManagerTest {
 
@@ -44,6 +60,149 @@ class RoomManagerTest {
     @BeforeEach
     void setUp() {
         roomManager = new RoomManager();
+    }
+
+    // =========================================================================
+    // Lobby discovery (LOBBY_STATE fan-out)
+    // =========================================================================
+
+    /**
+     * <h2>Scenario</h2>
+     * <ul>
+     *   <li>Client A completes handshake and waits in the discovery lobby.</li>
+     *   <li>Client B completes handshake, then {@code JOIN_ROOM} creates/joins
+     *       {@code "StudyGroup"} (modeled as {@link RoomManager#assignClientToRoom}).</li>
+     * </ul>
+     *
+     * <h2>Invariants</h2>
+     * <ol>
+     *   <li>The final {@code LOBBY_STATE} payload lists {@code StudyGroup} with
+     *       {@code userCount == 1} (only B is in the room; A is still in the lobby).</li>
+     *   <li>{@link RoomManager#snapshotLobbyKeys()} contains A and not B at that
+     *       point — matching what {@link NioServer} would fan out to A.</li>
+     * </ol>
+     */
+    @Test
+    void testLobbyStateBroadcast() {
+        List<Message> capturedLobbyStates = new CopyOnWriteArrayList<>();
+        roomManager.setLobbyFanout(buf -> {
+            ByteBuffer dup = buf.duplicate();
+            capturedLobbyStates.add(MessageCodec.decode(dup));
+        });
+
+        SelectionKey keyA = stubKey("Client-A");
+        SelectionKey keyB = stubKey("Client-B");
+
+        roomManager.registerHandshakeToLobby(keyA);
+        assertThat(roomManager.isInLobby(keyA))
+                .as("after HANDSHAKE, Client A must be registered in the lobby")
+                .isTrue();
+
+        roomManager.registerHandshakeToLobby(keyB);
+        assertThat(roomManager.isInLobby(keyB))
+                .as("after HANDSHAKE, Client B must be registered in the lobby")
+                .isTrue();
+
+        roomManager.assignClientToRoom(keyB, "StudyGroup", "");
+
+        assertThat(roomManager.isInLobby(keyA))
+                .as("Client A must remain in the lobby while B is in StudyGroup")
+                .isTrue();
+        assertThat(roomManager.isInLobby(keyB))
+                .as("after JOIN_ROOM, Client B must no longer be in the lobby set")
+                .isFalse();
+
+        assertThat(roomManager.snapshotLobbyKeys())
+                .as("only lobby clients receive LOBBY_STATE — A is subscribed, B is not")
+                .containsExactly(keyA);
+
+        assertThat(capturedLobbyStates)
+                .as("each lobby mutation must invoke the fan-out callback")
+                .isNotEmpty();
+
+        Message latest = capturedLobbyStates.get(capturedLobbyStates.size() - 1);
+        assertThat(latest.type())
+                .as("fan-out must encode LOBBY_STATE frames")
+                .isEqualTo(MessageType.LOBBY_STATE);
+
+        List<LobbyRoomEntry> entries = MessageCodec.decodeLobbyState(latest);
+        assertThat(entries)
+                .as("with one active room and one occupant, LOBBY_STATE must contain exactly one row")
+                .containsExactly(new LobbyRoomEntry("StudyGroup", 1));
+    }
+
+    /**
+     * <h2>Scenario</h2>
+     * Client A is in {@code Room1} (sole occupant). A {@code LEAVE_ROOM} is modeled
+     * as {@link RoomManager#returnClientToLobby(SelectionKey, String)}.
+     *
+     * <h2>Invariants</h2>
+     * <ol>
+     *   <li>A's key is removed from Room1's active-key set.</li>
+     *   <li>A is re-registered in {@code lobbyClients}.</li>
+     *   <li>When A was the last user, {@code Room1} is removed from the routing
+     *       map (graceful teardown of an empty room).</li>
+     * </ol>
+     */
+    @Test
+    void testLeaveRoomReturnsToLobby() {
+        SelectionKey keyA = stubKey("Client-A");
+
+        roomManager.registerHandshakeToLobby(keyA);
+        roomManager.assignClientToRoom(keyA, "Room1", "");
+
+        RoomContext room1 = roomManager.getRoom("Room1");
+        assertThat(room1)
+                .as("pre-condition: Room1 must exist after JOIN_ROOM")
+                .isNotNull();
+        assertThat(room1.getActiveKeys())
+                .as("pre-condition: Client A must be the sole active key in Room1")
+                .containsExactly(keyA);
+        assertThat(roomManager.isInLobby(keyA))
+                .as("pre-condition: Client A must not be in the lobby while in Room1")
+                .isFalse();
+
+        roomManager.returnClientToLobby(keyA, "Room1");
+
+        assertThat(roomManager.getRoom("Room1"))
+                .as("when the last client leaves, Room1 must be removed from the routing map")
+                .isNull();
+        assertThat(roomManager.getActiveClientKeys("Room1"))
+                .as("lookup by evicted room id must yield an empty key set")
+                .isEmpty();
+        assertThat(roomManager.isInLobby(keyA))
+                .as("after LEAVE_ROOM, Client A must be back in the lobby")
+                .isTrue();
+    }
+
+    /**
+     * Negative-space control: leaving a room must <em>not</em> delete the
+     * {@link RoomContext} while other clients remain connected.
+     */
+    @Test
+    void testLeaveRoomReturnsToLobby_preservesRoomWhenOthersRemain() {
+        SelectionKey keyA = stubKey("Client-A");
+        SelectionKey keyB = stubKey("Client-B");
+
+        roomManager.registerHandshakeToLobby(keyA);
+        roomManager.registerHandshakeToLobby(keyB);
+        roomManager.assignClientToRoom(keyA, "Room1", "");
+        roomManager.assignClientToRoom(keyB, "Room1", "");
+
+        assertThat(roomManager.getRoom("Room1").getActiveKeys())
+                .as("pre-condition: both clients share Room1")
+                .containsExactlyInAnyOrder(keyA, keyB);
+
+        roomManager.returnClientToLobby(keyA, "Room1");
+
+        assertThat(roomManager.getRoom("Room1"))
+                .as("Room1 must survive while Client B is still connected")
+                .isNotNull();
+        assertThat(roomManager.getRoom("Room1").getActiveKeys())
+                .as("only Client A should have been removed from the room")
+                .containsExactly(keyB);
+        assertThat(roomManager.isInLobby(keyA)).isTrue();
+        assertThat(roomManager.isInLobby(keyB)).isFalse();
     }
 
     // =========================================================================
@@ -542,6 +701,137 @@ class RoomManagerTest {
                 .as("all %d threads must have received the exact same RoomContext instance — " +
                     "computeIfAbsent must not create duplicates under contention", THREAD_COUNT)
                 .isEqualTo(1L);
+    }
+
+    // =========================================================================
+    // testRoomGc_EvictsIdleRoom
+    // =========================================================================
+
+    /**
+     * Verifies that {@link StorageLifecycleManager} evicts a quiescent room
+     * whose {@code lastActivityTimestamp} has aged beyond the GC TTL, while
+     * leaving recently-active rooms untouched.
+     *
+     * <h2>Setup</h2>
+     * <ul>
+     *   <li>{@code "GcRoom"} — created with 0 active clients; its
+     *       {@code lastActivityTimestamp} is back-dated to 10 minutes ago
+     *       (2× the 5-minute GC TTL of {@link StorageLifecycleManager#GC_TTL_MS})
+     *       via reflection.</li>
+     *   <li>{@code "ActiveRoom"} — created with a fresh timestamp; must
+     *       survive the sweep as a negative-space control.</li>
+     * </ul>
+     *
+     * <h2>Execution</h2>
+     * The private {@link StorageLifecycleManager} scan method
+     * ({@code runCycle()}) is invoked directly via reflection rather than
+     * waiting for the 60-second scheduled tick.  This keeps the test
+     * deterministic and free of real-time delays.
+     *
+     * <h2>Invariants asserted</h2>
+     * <ol>
+     *   <li><b>Precondition — room exists</b> — {@link RoomManager#getRoom}
+     *       returns non-null for both rooms before the sweep.</li>
+     *   <li><b>Precondition — client count</b> — {@code GcRoom} has 0 active
+     *       clients; the GC must not evict rooms that still have connected
+     *       sessions.</li>
+     *   <li><b>Precondition — timestamp injected</b> — the reflected field
+     *       value is verified to be exactly the value written, confirming the
+     *       reflection accessor worked as intended.</li>
+     *   <li><b>Eviction</b> — after {@code runCycle()}, {@code getRoom("GcRoom")}
+     *       returns {@code null}, confirming the room was removed from the
+     *       routing table.</li>
+     *   <li><b>Selective eviction</b> — {@code "ActiveRoom"} is still present
+     *       in the routing table after the sweep, confirming the daemon applies
+     *       the TTL filter and does not evict all rooms indiscriminately.</li>
+     *   <li><b>Re-join creates a fresh context</b> — calling
+     *       {@link RoomManager#getOrCreateRoom} for the evicted room ID after
+     *       eviction must produce a brand-new {@link RoomContext} with an empty
+     *       canvas, not the stale evicted instance.</li>
+     * </ol>
+     */
+    @Test
+    void testRoomGc_EvictsIdleRoom(@TempDir Path gcTempDir) throws Exception {
+        try (WalManager walManager = new WalManager(gcTempDir)) {
+            RoomManager rm = new RoomManager(walManager);
+
+            // ── Setup: create GcRoom (to be evicted) and ActiveRoom (survivor) ──
+            RoomContext gcRoom     = rm.getOrCreateRoom("GcRoom");
+            RoomContext activeRoom = rm.getOrCreateRoom("ActiveRoom");
+
+            // Explicitly refresh ActiveRoom's timestamp so it is clearly within TTL.
+            activeRoom.touchActivity();
+
+            // ── 1. Precondition: both rooms must be present before the sweep ─────
+            assertThat(rm.getRoom("GcRoom"))
+                    .as("pre-condition: GcRoom must exist in the routing table before the lifecycle sweep")
+                    .isNotNull();
+            assertThat(rm.getRoom("ActiveRoom"))
+                    .as("pre-condition: ActiveRoom must exist in the routing table before the lifecycle sweep")
+                    .isNotNull();
+
+            // ── 2. Precondition: GcRoom must have 0 active clients ───────────────
+            //    GC eviction only fires when clients == 0; a room with connected
+            //    sessions must never be evicted, regardless of its timestamp.
+            assertThat(gcRoom.getActiveClientCount())
+                    .as("pre-condition: GcRoom must have 0 active clients — " +
+                        "GC must not evict rooms that still have live connections")
+                    .isZero();
+
+            // ── 3. Backdate GcRoom's lastActivityTimestamp to 10 minutes ago ─────
+            //    The GC TTL is StorageLifecycleManager.GC_TTL_MS (5 min = 300 000 ms).
+            //    Setting the timestamp to 10 minutes ago (600 000 ms) makes it 2×
+            //    past the threshold, giving a comfortable margin against clock jitter.
+            Field tsField = RoomContext.class.getDeclaredField("lastActivityTimestamp");
+            tsField.setAccessible(true);
+            long tenMinutesAgo = System.currentTimeMillis() - 600_000L;
+            tsField.setLong(gcRoom, tenMinutesAgo);
+
+            // Verify the reflection write took effect before trusting the sweep outcome.
+            assertThat(tsField.getLong(gcRoom))
+                    .as("reflected lastActivityTimestamp must equal the value we wrote — " +
+                        "if this fails, the field name has changed or reflection is broken")
+                    .isEqualTo(tenMinutesAgo);
+
+            // ── 4. Invoke the lifecycle scan synchronously via reflection ─────────
+            //    We call the private runCycle() method directly rather than waiting
+            //    for the 60-second ScheduledExecutorService tick; this keeps the test
+            //    deterministic and free of any real-time delay.
+            StorageLifecycleManager lifecycle = new StorageLifecycleManager(rm, walManager);
+            Method runCycle = StorageLifecycleManager.class.getDeclaredMethod("runCycle");
+            runCycle.setAccessible(true);
+            runCycle.invoke(lifecycle);
+
+            // ── 5. GcRoom must have been evicted from the routing table ───────────
+            assertThat(rm.getRoom("GcRoom"))
+                    .as("GcRoom must be removed from the RoomManager routing table after the " +
+                        "lifecycle sweep — it had 0 clients and was quiescent for 10 min " +
+                        "(TTL threshold: " + StorageLifecycleManager.GC_TTL_MS / 60_000L + " min)")
+                    .isNull();
+
+            // ── 6. ActiveRoom must NOT have been evicted ──────────────────────────
+            assertThat(rm.getRoom("ActiveRoom"))
+                    .as("ActiveRoom must still be present after the sweep — its timestamp is " +
+                        "well within the GC TTL and must not be collateral damage of the eviction")
+                    .isNotNull();
+
+            // ── 7. Re-joining the evicted room creates a fresh, empty context ─────
+            //    A client reconnecting after GC must get a clean slate, not the
+            //    evicted (now-detached) RoomContext.
+            RoomContext rejoinedRoom = rm.getOrCreateRoom("GcRoom");
+
+            assertThat(rejoinedRoom)
+                    .as("getOrCreateRoom after eviction must return a non-null RoomContext")
+                    .isNotNull();
+            assertThat(rejoinedRoom.stateManager.size())
+                    .as("the re-created room must have an empty canvas — " +
+                        "the WAL was archived during GC so no old shapes are replayed")
+                    .isZero();
+            assertThat(rejoinedRoom)
+                    .as("the re-created RoomContext must be a distinct instance from the evicted one — " +
+                        "getOrCreateRoom must not resurrect the old (evicted) reference")
+                    .isNotSameAs(gcRoom);
+        }
     }
 
     // =========================================================================

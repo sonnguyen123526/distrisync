@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.List;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.*;
@@ -86,6 +87,64 @@ class MessageCodecTest {
         assertThat(msg.type()).isEqualTo(MessageType.UDP_POINTER);
         assertThat(decoded.x()).isEqualTo(original.x());
         assertThat(decoded.y()).isEqualTo(original.y());
+    }
+
+    @Test
+    void handshake_encode_decode_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeHandshake("Alice", "cid-1");
+        Message    msg   = MessageCodec.decode(frame);
+        MessageCodec.HandshakePayload hp = MessageCodec.decodeHandshake(msg);
+
+        assertThat(msg.type()).isEqualTo(MessageType.HANDSHAKE);
+        assertThat(hp.authorName()).isEqualTo("Alice");
+        assertThat(hp.clientId()).isEqualTo("cid-1");
+    }
+
+    @Test
+    void handshake_legacyRoomIdInJson_isIgnored() {
+        String legacyJson = "{\"authorName\":\"x\",\"clientId\":\"y\",\"roomId\":\"old-room\"}";
+        Message msg = new Message(MessageType.HANDSHAKE, legacyJson);
+        MessageCodec.HandshakePayload hp = MessageCodec.decodeHandshake(msg);
+        assertThat(hp.authorName()).isEqualTo("x");
+        assertThat(hp.clientId()).isEqualTo("y");
+    }
+
+    @Test
+    void handshake_decodeHandshake_wrongType_throws() {
+        Message wrong = new Message(MessageType.MUTATION, "{}");
+        assertThatIllegalArgumentException()
+                .isThrownBy(() -> MessageCodec.decodeHandshake(wrong));
+    }
+
+    @Test
+    void lobbyState_roundTrip() {
+        List<MessageCodec.LobbyRoomEntry> in = List.of(
+                new MessageCodec.LobbyRoomEntry("COMP352", 3),
+                new MessageCodec.LobbyRoomEntry("LobbyTest", 0));
+        ByteBuffer frame = MessageCodec.encodeLobbyState(in);
+        Message msg = MessageCodec.decode(frame);
+        assertThat(msg.type()).isEqualTo(MessageType.LOBBY_STATE);
+        List<MessageCodec.LobbyRoomEntry> out = MessageCodec.decodeLobbyState(msg);
+        assertThat(out).hasSize(2);
+        assertThat(out.get(0).roomId()).isEqualTo("COMP352");
+        assertThat(out.get(0).userCount()).isEqualTo(3);
+        assertThat(out.get(1).userCount()).isZero();
+    }
+
+    @Test
+    void joinRoom_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeJoinRoom("my-room");
+        Message msg = MessageCodec.decode(frame);
+        assertThat(msg.type()).isEqualTo(MessageType.JOIN_ROOM);
+        assertThat(MessageCodec.decodeJoinRoom(msg)).isEqualTo("my-room");
+    }
+
+    @Test
+    void leaveRoom_encodesEmptyPayload() {
+        ByteBuffer frame = MessageCodec.encodeLeaveRoom();
+        Message msg = MessageCodec.decode(frame);
+        assertThat(msg.type()).isEqualTo(MessageType.LEAVE_ROOM);
+        assertThat(msg.payload()).isEmpty();
     }
 
     // =========================================================================
