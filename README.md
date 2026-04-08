@@ -49,6 +49,10 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Reconnect with Back-off** — `NetworkClient` reconnects automatically after EOF or I/O errors using a synchronised `reconnect()` cycle that re-executes the full `HANDSHAKE` → `SNAPSHOT` flow to restore canvas state.
 
+- **Lobby Discovery & Room Management (`LOBBY_STATE` / `JOIN_ROOM` / `LEAVE_ROOM`)** — clients connect to a lobby state and receive periodic `LOBBY_STATE` broadcasts listing all active rooms with live user counts. `JOIN_ROOM` transitions a client from lobby into a specific room's canvas; `LEAVE_ROOM` returns to the lobby. The server maintains a single global lobby session for discovery and scoped room sessions for drawing, allowing efficient multi-room deployments with isolated state per room.
+
+- **Idle Room Eviction & Storage Lifecycle** — `StorageLifecycleManager` is a background daemon that runs a garbage-collection sweep every 60 seconds, evicting rooms with zero active clients and idle longer than 5 minutes. Evicted rooms are removed from the in-memory `RoomManager` registry to reclaim heap, while their WAL files are preserved on disk for potential manual recovery. Connected clients are never evicted regardless of inactivity, ensuring users in an open drawing session are never interrupted.
+
 ---
 
 ## Project Structure
@@ -63,6 +67,8 @@ distrisync/
 │   │   │   │   ├── NetworkClient.java
 │   │   │   │   ├── UdpPointerTracker.java
 │   │   │   │   ├── CanvasUpdateListener.java
+│   │   │   │   ├── LobbyUpdateListener.java
+│   │   │   │   ├── RoomInfo.java
 │   │   │   │   ├── PointerState.java
 │   │   │   │   └── PointerStateManager.java
 │   │   │   ├── server/              # NIO server, room routing, WAL, canvas authority
@@ -70,6 +76,7 @@ distrisync/
 │   │   │   │   ├── NioServer.java
 │   │   │   │   ├── RoomManager.java
 │   │   │   │   ├── RoomContext.java
+│   │   │   │   ├── StorageLifecycleManager.java
 │   │   │   │   ├── WalManager.java
 │   │   │   │   ├── CanvasStateManager.java
 │   │   │   │   ├── ClientSession.java
@@ -119,6 +126,9 @@ distrisync/
 | `UNDO_REQUEST` | `0x09` | C → S | No | Request last-shape deletion |
 | `SHAPE_DELETE` | `0x0A` | S → C | **Yes** | Broadcast shape removal after undo |
 | `TEXT_UPDATE` | `0x0B` | C ↔ S | No | Live text ghost preview; relayed, not persisted |
+| `LOBBY_STATE` | `0x0C` | S → C | No | JSON array of `{ roomId, userCount }` for room discovery |
+| `JOIN_ROOM` | `0x0D` | C → S | No | Transition from lobby to a named room |
+| `LEAVE_ROOM` | `0x0E` | C → S | No | Return from a room to lobby (empty payload) |
 
 ---
 
