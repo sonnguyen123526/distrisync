@@ -2,165 +2,302 @@ package com.distrisync.server;
 
 import com.distrisync.model.Shape;
 import com.distrisync.protocol.Message;
+import com.distrisync.protocol.MessageCodec;
+import com.distrisync.protocol.MessageCodec.LobbyRoomEntry;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
-import java.util.Collections;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
 /**
- * Central routing registry that maps room identifiers to their isolated
- * {@link RoomContext}s.
+ * Multi-tenant room registry plus a global discovery lobby.
  *
- * <h2>Lifecycle</h2>
- * Rooms are created lazily on first join and currently persist for the
- * lifetime of the server.  A room whose last client disconnects becomes
- * quiescent: its {@link CanvasStateManager} retains the canvas state so
- * that rejoining clients receive the same snapshot they left behind.
+ * <p>Maintains a {@link ConcurrentHashMap} of {@link RoomContext}s keyed by
+ * room ID.  Room creation is atomic via
+ * {@link ConcurrentHashMap#computeIfAbsent}, so concurrent clients racing to
+ * join the same room for the first time always receive the same
+ * {@link RoomContext} instance.
+ *
+ * <p>Clients that have completed {@code HANDSHAKE} but not yet {@code JOIN_ROOM}
+ * are tracked in {@link #lobbyClients}.  Any change to lobby membership or to
+ * per-room occupancy triggers a fresh {@link com.distrisync.protocol.MessageType#LOBBY_STATE}
+ * fan-out via the {@link #setLobbyFanout} callback (installed by {@link NioServer}).
  *
  * <h2>WAL integration</h2>
- * Each {@code RoomManager} is constructed with an optional {@link WalManager}.
- * When provided:
- * <ul>
- *   <li>New {@link RoomContext}s are initialised via
- *       {@link WalManager#recover(String)} so that a restarted server
- *       immediately reconstructs canvas state from the durable log.</li>
- *   <li>Callers use {@link #appendToWal(String, Message)} to persist every
- *       accepted state-mutating message before broadcasting it.</li>
- * </ul>
- * Passing {@code null} for {@code walManager} disables persistence entirely
- * (useful in tests and ephemeral deployments).
+ * An optional {@link WalManager} may be supplied at construction.  When present
+ * each {@link #appendToWal} call persists the message before it is broadcast;
+ * room construction replays the WAL so state survives server restarts.
  *
  * <h2>Thread safety</h2>
- * All public methods delegate to a {@link ConcurrentHashMap} and are safe
- * to call concurrently from the NIO event loop thread and any admin thread.
+ * All public methods are safe to call from multiple threads concurrently.
  */
 public final class RoomManager {
 
     private static final Logger log = LoggerFactory.getLogger(RoomManager.class);
 
     private final ConcurrentHashMap<String, RoomContext> rooms = new ConcurrentHashMap<>();
-
-    /** May be {@code null} when WAL persistence is disabled. */
     private final WalManager walManager;
 
-    // -------------------------------------------------------------------------
-    // Construction
-    // -------------------------------------------------------------------------
+    /** TCP keys waiting in the discovery lobby (post-handshake, pre-join). */
+    private final Set<SelectionKey> lobbyClients = ConcurrentHashMap.newKeySet();
 
     /**
-     * Creates a {@code RoomManager} backed by the supplied {@link WalManager}.
+     * Delivers a fully encoded {@code LOBBY_STATE} frame to every lobby client.
+     * Set by {@link NioServer} on the selector thread; may also be invoked from
+     * the storage lifecycle daemon after GC.
+     */
+    private volatile Consumer<ByteBuffer> lobbyFanout;
+
+    /** Creates a room manager with no WAL persistence (rooms are ephemeral). */
+    public RoomManager() {
+        this.walManager = null;
+    }
+
+    /**
+     * Creates a WAL-backed room manager.
      *
-     * @param walManager the WAL engine used for both recovery and appending;
-     *                   {@code null} disables persistence
+     * @param walManager the WAL engine used for append and recovery;
+     *                   must not be {@code null}
      */
     public RoomManager(WalManager walManager) {
+        if (walManager == null) throw new IllegalArgumentException("walManager must not be null");
         this.walManager = walManager;
     }
 
     /**
-     * Convenience constructor for deployments that do not require persistence.
-     * Equivalent to {@code new RoomManager(null)}.
+     * Installs the callback that broadcasts {@code LOBBY_STATE} to all current
+     * lobby subscribers.  Typically invoked once from {@link NioServer#run()}.
      */
-    public RoomManager() {
-        this(null);
+    public void setLobbyFanout(Consumer<ByteBuffer> fanout) {
+        this.lobbyFanout = fanout;
     }
 
-    // -------------------------------------------------------------------------
-    // Room access
-    // -------------------------------------------------------------------------
+    /** @return {@code true} if {@code key} is registered in the discovery lobby */
+    public boolean isInLobby(SelectionKey key) {
+        return lobbyClients.contains(key);
+    }
 
     /**
-     * Returns the existing {@link RoomContext} for {@code roomId}, or atomically
-     * creates and registers a new one if none exists yet.
+     * After a successful {@code HANDSHAKE}, registers the client in the lobby and
+     * pushes an updated {@code LOBBY_STATE} to all lobby clients (including the new one).
+     */
+    public void registerHandshakeToLobby(SelectionKey key) {
+        if (lobbyClients.add(key)) {
+            notifyLobbySubscribers();
+        }
+    }
+
+    /**
+     * Removes a key from the lobby set without touching canvas rooms.  Used on disconnect.
+     */
+    public void removeFromLobby(SelectionKey key) {
+        if (lobbyClients.remove(key)) {
+            notifyLobbySubscribers();
+        }
+    }
+
+    /**
+     * Moves a client from the lobby (or from {@code previousRoomId} if non-blank)
+     * into {@code newRoomId}, then broadcasts {@code LOBBY_STATE}.
      *
-     * <p>When a new room is created and a {@link WalManager} is present, the
-     * room's {@link RoomContext} constructor immediately replays any persisted
-     * WAL records so that the first joining client receives a fully recovered
-     * {@code SNAPSHOT}.
+     * @param previousRoomId room the client was in, or blank if coming from lobby only
+     * @return the {@link RoomContext} for {@code newRoomId}
+     */
+    public RoomContext assignClientToRoom(SelectionKey key, String newRoomId, String previousRoomId) {
+        if (newRoomId == null || newRoomId.isBlank()) {
+            throw new IllegalArgumentException("newRoomId must not be null or blank");
+        }
+        lobbyClients.remove(key);
+        if (previousRoomId != null && !previousRoomId.isBlank()) {
+            RoomContext prev = rooms.get(previousRoomId);
+            if (prev != null) {
+                prev.removeKey(key);
+            }
+        }
+        RoomContext ctx = getOrCreateRoom(newRoomId);
+        ctx.addKey(key);
+        notifyLobbySubscribers();
+        return ctx;
+    }
+
+    /**
+     * Removes a client from their canvas room and places them back in the lobby.
+     */
+    public void returnClientToLobby(SelectionKey key, String currentRoomId) {
+        if (currentRoomId == null || currentRoomId.isBlank()) {
+            return;
+        }
+        RoomContext room = rooms.get(currentRoomId);
+        if (room != null) {
+            room.removeKey(key);
+            if (room.getActiveClientCount() == 0) {
+                rooms.remove(currentRoomId, room);
+            }
+        }
+        lobbyClients.add(key);
+        notifyLobbySubscribers();
+    }
+
+    // =========================================================================
+    // Room lifecycle
+    // =========================================================================
+
+    /**
+     * Returns the existing {@link RoomContext} for {@code roomId}, or creates
+     * one if none exists.  The creation is atomic — concurrent callers always
+     * receive the same instance.
      *
-     * @param roomId the room identifier; must not be {@code null} or blank
-     * @return the (possibly newly created) {@link RoomContext}
+     * <p>When this manager was constructed with a {@link WalManager} the new
+     * room's constructor will replay any existing WAL for this room ID.
+     *
+     * @param roomId non-null, non-blank room identifier
+     * @return the canonical {@link RoomContext} for this room
+     * @throws IllegalArgumentException if {@code roomId} is {@code null} or blank
      */
     public RoomContext getOrCreateRoom(String roomId) {
-        if (roomId == null || roomId.isBlank())
-            throw new IllegalArgumentException("roomId must not be blank");
+        if (roomId == null || roomId.isBlank()) {
+            throw new IllegalArgumentException("roomId must not be null or blank");
+        }
         return rooms.computeIfAbsent(roomId, id -> {
-            log.info("Room created  roomId='{}'", id);
+            log.info("Creating room  roomId='{}'", id);
             return new RoomContext(id, walManager);
         });
     }
 
     /**
      * Returns the {@link RoomContext} for {@code roomId}, or {@code null} if
-     * no such room has been created yet.
+     * no room with that ID exists.
      *
-     * @param roomId the room identifier
-     * @return the {@link RoomContext}, or {@code null}
+     * @param roomId the room to look up; {@code null} returns {@code null}
      */
     public RoomContext getRoom(String roomId) {
-        return roomId != null ? rooms.get(roomId) : null;
+        if (roomId == null) return null;
+        return rooms.get(roomId);
     }
 
     /**
-     * Returns a point-in-time snapshot of all shapes in the named room.
-     * Returns an empty list if the room does not exist.
+     * Returns a point-in-time snapshot of the canvas for {@code roomId}.
      *
-     * @param roomId the room identifier
-     * @return an immutable snapshot of the room's current shapes
+     * <p>Returns an empty, unmodifiable list if the room does not exist.
+     *
+     * @param roomId the room to query; may be {@code null}
      */
     public List<Shape> getRoomSnapshot(String roomId) {
-        RoomContext ctx = getRoom(roomId);
-        return ctx != null ? ctx.stateManager.snapshot() : Collections.emptyList();
+        RoomContext room = getRoom(roomId);
+        return room != null ? room.stateManager.snapshot() : List.of();
     }
 
+    // =========================================================================
+    // Client management
+    // =========================================================================
+
     /**
-     * Removes {@code key} from the active-key set of the named room.
-     * A no-op if the room does not exist or the key was not registered.
+     * Removes {@code key} from the active-key set of {@code roomId}.
      *
-     * @param roomId the room identifier the disconnecting session belonged to
-     * @param key    the {@link SelectionKey} being cancelled
+     * <p>A {@code null} or blank {@code roomId} is silently ignored —
+     * sessions that disconnect before completing their HANDSHAKE have
+     * {@code roomId == ""} and must not trigger an exception.
+     *
+     * @param roomId the room to remove from; null/blank → no-op
+     * @param key    the client key to remove
      */
     public void removeClientFromRoom(String roomId, SelectionKey key) {
         if (roomId == null || roomId.isBlank()) return;
-        RoomContext ctx = rooms.get(roomId);
-        if (ctx != null) {
-            ctx.removeKey(key);
-            log.debug("Client removed from room  roomId='{}' key={}", roomId, key);
+        RoomContext room = rooms.get(roomId);
+        if (room != null && room.removeKey(key)) {
+            notifyLobbySubscribers();
         }
     }
 
-    // -------------------------------------------------------------------------
-    // WAL append
-    // -------------------------------------------------------------------------
+    /**
+     * Returns an unmodifiable view of {@link SelectionKey}s currently registered
+     * in {@code roomId}, or an empty set if the room does not exist.
+     *
+     * <p>Used by {@link NioServer} for room-scoped broadcast fan-out.
+     *
+     * @param roomId the room to query; {@code null} yields an empty set
+     */
+    public Set<SelectionKey> getActiveClientKeys(String roomId) {
+        RoomContext ctx = getRoom(roomId);
+        return ctx != null ? ctx.getActiveKeys() : Set.of();
+    }
 
     /**
-     * Appends a state-mutating {@link Message} to the room's WAL file.
-     *
-     * <p>Should be called by {@code NioServer} immediately <em>before</em>
-     * broadcasting any accepted mutation so that the WAL record is written
-     * even if the broadcast subsequently fails.
-     *
-     * <p>If no {@link WalManager} was supplied at construction time, this
-     * method is a no-op.  Any {@link IOException} from the underlying
-     * {@link FileChannel} write is logged at {@code WARN} level rather than
-     * propagated; the mutation has already been applied in memory and dropping
-     * a single WAL record degrades durability but does not break the live
-     * session.
-     *
-     * @param roomId  the room to which the message belongs
-     * @param message the accepted, state-mutating message to persist
+     * Snapshot of lobby keys for iteration on the NIO thread (avoids concurrent
+     * modification while fanning out {@code LOBBY_STATE}).
      */
-    public void appendToWal(String roomId, Message message) {
+    List<SelectionKey> snapshotLobbyKeys() {
+        return List.copyOf(lobbyClients);
+    }
+
+    private List<LobbyRoomEntry> buildLobbyRoomEntries() {
+        List<LobbyRoomEntry> list = new ArrayList<>(rooms.size());
+        for (var e : rooms.entrySet()) {
+            list.add(new LobbyRoomEntry(e.getKey(), e.getValue().getActiveClientCount()));
+        }
+        list.sort(Comparator.comparing(LobbyRoomEntry::roomId));
+        return list;
+    }
+
+    private void notifyLobbySubscribers() {
+        Consumer<ByteBuffer> fan = lobbyFanout;
+        if (fan == null) {
+            return;
+        }
+        ByteBuffer frame = MessageCodec.encodeLobbyState(buildLobbyRoomEntries());
+        fan.accept(frame);
+    }
+
+    // =========================================================================
+    // WAL delegation
+    // =========================================================================
+
+    /**
+     * Appends {@code msg} to the WAL for {@code roomId}.
+     *
+     * <p>No-op if this manager was constructed without a {@link WalManager}.
+     * I/O errors are logged but not re-thrown so that a WAL write failure
+     * never disrupts the NIO event loop.
+     *
+     * @param roomId the room whose WAL receives the record
+     * @param msg    the message to persist
+     */
+    public void appendToWal(String roomId, Message msg) {
         if (walManager == null) return;
         try {
-            walManager.append(roomId, message);
+            walManager.append(roomId, msg);
         } catch (IOException e) {
-            log.warn("WAL append failed  roomId='{}' type={} — durability degraded: {}",
-                    roomId, message.type(), e.getMessage());
+            log.error("WAL append failed  room='{}': {}", roomId, e.getMessage(), e);
         }
+    }
+
+    // =========================================================================
+    // Package-private hooks for StorageLifecycleManager
+    // =========================================================================
+
+    /**
+     * Removes the room from the routing table.  Called by
+     * {@link StorageLifecycleManager} when a room is GC-eligible.
+     */
+    void removeRoom(String roomId) {
+        rooms.remove(roomId);
+        log.info("Room evicted by GC  roomId='{}'", roomId);
+        notifyLobbySubscribers();
+    }
+
+    /**
+     * Exposes the room map for iteration by the lifecycle manager.
+     * The caller must not modify the returned map.
+     */
+    ConcurrentHashMap<String, RoomContext> getRooms() {
+        return rooms;
     }
 }

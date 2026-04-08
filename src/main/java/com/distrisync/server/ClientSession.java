@@ -40,11 +40,15 @@ final class ClientSession {
     volatile String clientId = "";
 
     /**
-     * Room identifier supplied in the {@code HANDSHAKE} frame.
-     * Determines which {@link RoomContext} this session is routed to.
-     * Remains empty until the first valid HANDSHAKE is processed.
+     * Canvas room id after a successful {@code JOIN_ROOM}; empty while the
+     * client is in the discovery lobby.
      */
     volatile String roomId = "";
+
+    /**
+     * Set after the first {@code HANDSHAKE} is accepted; duplicate handshakes are ignored.
+     */
+    volatile boolean handshakeComplete = false;
 
     /**
      * Accumulation buffer for inbound bytes.

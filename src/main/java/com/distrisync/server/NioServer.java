@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Central-authority server for the DistriSync collaborative whiteboard.
@@ -35,22 +36,25 @@ import java.util.concurrent.CompletableFuture;
  * <h2>Multi-tenant connection lifecycle</h2>
  * <ol>
  *   <li><b>Accept</b> – a new {@link SocketChannel} is registered for
- *       {@code OP_READ} with a fresh {@link ClientSession} as the attachment.
- *       <em>No snapshot is sent yet</em>; the server waits for a HANDSHAKE
- *       to learn which room the client wants to join.</li>
- *   <li><b>HANDSHAKE</b> – the first frame from a connected client must be a
- *       {@code HANDSHAKE} carrying {@code authorName}, {@code clientId}, and
- *       the new {@code roomId}.  The server registers the key in the
- *       matching {@link RoomContext} (creating one if necessary) and sends
- *       that room's {@code SNAPSHOT} to the new client only.</li>
+ *       {@code OP_READ} with a fresh {@link ClientSession}.  The client sends
+ *       {@code HANDSHAKE} (lobby + {@code LOBBY_STATE}), then {@code JOIN_ROOM}
+ *       for a canvas {@code SNAPSHOT}.</li>
+ *   <li><b>HANDSHAKE</b> – the first frame must be a {@code HANDSHAKE} with
+ *       {@code authorName} and {@code clientId}.  The client is placed in the
+ *       global discovery lobby; the server pushes {@code LOBBY_STATE} to all
+ *       lobby clients.</li>
+ *   <li><b>JOIN_ROOM</b> – client leaves the lobby and enters a canvas room;
+ *       the server sends that room's {@code SNAPSHOT}.</li>
+ *   <li><b>LEAVE_ROOM</b> – client returns to the lobby and receives a fresh
+ *       {@code LOBBY_STATE}.</li>
  *   <li><b>Read / mutation</b> – subsequent frames are dispatched to the
  *       room identified by {@code session.roomId}.  Mutations go through
  *       the room's own {@link CanvasStateManager} and are broadcast only to
  *       other clients in the <em>same room</em>.</li>
  *   <li><b>Write</b> – {@code OP_WRITE} is armed only when a previous write
  *       was partial (TCP send-buffer full).</li>
- *   <li><b>Disconnect</b> – the key is removed from its room's active-key
- *       set before the channel is closed.</li>
+ *   <li><b>Disconnect</b> – the key is removed from the lobby or its canvas
+ *       room before the channel is closed.</li>
  * </ol>
  *
  * <h2>Thread safety</h2>
@@ -85,6 +89,12 @@ public final class NioServer implements Runnable {
     private volatile Selector selector;
 
     /**
+     * Cross-thread lobby broadcasts: {@link RoomManager} may call the fanout from
+     * the storage lifecycle thread; frames are drained on the selector thread.
+     */
+    private final ConcurrentLinkedQueue<ByteBuffer> pendingLobbyFrames = new ConcurrentLinkedQueue<>();
+
+    /**
      * @param port        TCP port to bind; must be in the range [0, 65535]
      * @param roomManager the multi-tenant routing registry
      */
@@ -112,6 +122,12 @@ public final class NioServer implements Runnable {
 
             this.selector = selector;
 
+            final Selector selectorRef = selector;
+            roomManager.setLobbyFanout(frame -> {
+                pendingLobbyFrames.offer(frame);
+                selectorRef.wakeup();
+            });
+
             serverChannel.configureBlocking(false);
             serverChannel.bind(new InetSocketAddress(port));
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
@@ -122,10 +138,8 @@ public final class NioServer implements Runnable {
             log.info("NioServer listening — port={} minConcurrentClients=4", actualPort);
 
             while (!stopped && !Thread.currentThread().isInterrupted()) {
-                int readyCount = selector.select();
-                if (readyCount == 0) {
-                    continue;
-                }
+                selector.select();
+                drainPendingLobbyBroadcasts();
 
                 Set<SelectionKey> selected = selector.selectedKeys();
                 for (SelectionKey key : selected) {
@@ -172,9 +186,8 @@ public final class NioServer implements Runnable {
 
     /**
      * Registers the new channel for reads and attaches a fresh
-     * {@link ClientSession}.  <em>No snapshot is sent here</em>; the client
-     * must send a {@code HANDSHAKE} first so the server knows which room to
-     * join it to.
+     * {@link ClientSession}.  The client must send {@code HANDSHAKE} then
+     * {@code JOIN_ROOM} before receiving a canvas {@code SNAPSHOT}.
      */
     private void handleAccept(ServerSocketChannel serverChannel, Selector selector) throws IOException {
         SocketChannel clientChannel = serverChannel.accept();
@@ -253,32 +266,61 @@ public final class NioServer implements Runnable {
 
         switch (msg.type()) {
             case HANDSHAKE -> {
-                try {
-                    JsonObject p = JsonParser.parseString(msg.payload()).getAsJsonObject();
-                    if (p.has("authorName") && !p.get("authorName").isJsonNull()) {
-                        session.authorName = p.get("authorName").getAsString();
-                    }
-                    if (p.has("clientId") && !p.get("clientId").isJsonNull()) {
-                        session.clientId = p.get("clientId").getAsString();
-                    }
-                    if (p.has("roomId") && !p.get("roomId").isJsonNull()) {
-                        String rid = p.get("roomId").getAsString().strip();
-                        session.roomId = rid.isBlank() ? "Global" : rid;
-                    } else {
-                        session.roomId = "Global";
-                    }
-                } catch (Exception ignored) {
-                    session.roomId = "Global";
+                if (session.handshakeComplete) {
+                    log.warn("Duplicate HANDSHAKE session={} — ignoring", session.sessionId);
+                    break;
                 }
+                MessageCodec.HandshakePayload hp = MessageCodec.decodeHandshake(msg);
+                session.authorName = hp.authorName();
+                session.clientId   = hp.clientId();
+                session.roomId     = "";
+                session.handshakeComplete = true;
 
-                // Register this key with the room and send the room's snapshot.
-                RoomContext room = roomManager.getOrCreateRoom(session.roomId);
-                room.addKey(senderKey);
+                roomManager.registerHandshakeToLobby(senderKey);
 
-                log.info("HANDSHAKE session={} authorName='{}' clientId='{}' roomId='{}'",
-                        session.sessionId, session.authorName, session.clientId, session.roomId);
+                log.info("HANDSHAKE session={} authorName='{}' clientId='{}' → lobby",
+                        session.sessionId, session.authorName, session.clientId);
+            }
 
-                sendSnapshot(session, senderKey, room);
+            case JOIN_ROOM -> {
+                if (!session.handshakeComplete) {
+                    log.warn("JOIN_ROOM before HANDSHAKE session={}", session.sessionId);
+                    break;
+                }
+                String raw;
+                try {
+                    raw = MessageCodec.decodeJoinRoom(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed JOIN_ROOM session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                String rid = raw != null ? raw.strip() : "";
+                if (rid.isBlank()) {
+                    log.warn("Blank JOIN_ROOM session={}", session.sessionId);
+                    break;
+                }
+                try {
+                    RoomContext room = roomManager.assignClientToRoom(senderKey, rid, session.roomId);
+                    session.roomId = rid;
+                    sendSnapshot(session, senderKey, room);
+                    log.info("JOIN_ROOM session={} roomId='{}'", session.sessionId, rid);
+                } catch (IllegalArgumentException e) {
+                    log.warn("JOIN_ROOM rejected session={}: {}", session.sessionId, e.getMessage());
+                }
+            }
+
+            case LEAVE_ROOM -> {
+                if (!session.handshakeComplete) {
+                    break;
+                }
+                if (session.roomId.isBlank()) {
+                    log.debug("LEAVE_ROOM no-op — already in lobby session={}", session.sessionId);
+                    break;
+                }
+                String cur = session.roomId;
+                roomManager.returnClientToLobby(senderKey, cur);
+                session.roomId = "";
+                log.info("LEAVE_ROOM session={} → lobby", session.sessionId);
             }
 
             case MUTATION -> {
@@ -384,6 +426,8 @@ public final class NioServer implements Runnable {
                 }
             }
 
+            case LOBBY_STATE -> log.trace("Ignoring client-originated LOBBY_STATE echo session={}", session.sessionId);
+
             default -> log.warn("Unexpected message type={} from session={} — ignoring",
                     msg.type(), session.sessionId);
         }
@@ -391,12 +435,13 @@ public final class NioServer implements Runnable {
 
     /**
      * Resolves the {@link RoomContext} for the given session.  Logs a warning
-     * and returns {@code null} if the session has not yet completed its
-     * HANDSHAKE (i.e. {@code roomId} is still blank).
+     * and returns {@code null} if the client is still in the lobby or has not
+     * completed {@code JOIN_ROOM} ({@code session.roomId} is blank).
      */
     private RoomContext resolveRoom(ClientSession session, SelectionKey key) {
         if (session.roomId.isBlank()) {
-            log.warn("Message received before HANDSHAKE from session={} — ignoring", session.sessionId);
+            log.warn("Canvas message while in lobby (send JOIN_ROOM first) session={} — ignoring",
+                    session.sessionId);
             return null;
         }
         RoomContext room = roomManager.getRoom(session.roomId);
@@ -429,6 +474,42 @@ public final class NioServer implements Runnable {
     }
 
     // =========================================================================
+    // Lobby broadcast
+    // =========================================================================
+
+    private void drainPendingLobbyBroadcasts() {
+        ByteBuffer frame;
+        while ((frame = pendingLobbyFrames.poll()) != null) {
+            deliverLobbyStateFrame(frame);
+        }
+    }
+
+    /**
+     * Enqueues one {@code LOBBY_STATE} frame to every client currently in the lobby.
+     * Must run on the selector thread.
+     */
+    private void deliverLobbyStateFrame(ByteBuffer frame) {
+        List<SelectionKey> keys = roomManager.snapshotLobbyKeys();
+        List<SelectionKey> toClose = new ArrayList<>();
+
+        for (SelectionKey key : keys) {
+            if (!key.isValid()) {
+                continue;
+            }
+            if (!(key.attachment() instanceof ClientSession session)) {
+                continue;
+            }
+            session.enqueue(frame);
+            if (!flushWriteQueue(session, key)) {
+                toClose.add(key);
+            }
+        }
+
+        log.debug("LOBBY_STATE fan-out  lobbyClients={}", keys.size());
+        toClose.forEach(this::closeKey);
+    }
+
+    // =========================================================================
     // Room-scoped broadcast
     // =========================================================================
 
@@ -446,16 +527,18 @@ public final class NioServer implements Runnable {
      * @param senderKey the originating client's key; excluded from delivery
      */
     private void broadcastToRoom(String roomId, ByteBuffer frame, SelectionKey senderKey) {
-        RoomContext room = roomManager.getRoom(roomId);
-        if (room == null) {
-            log.warn("broadcastToRoom called for unknown roomId='{}'", roomId);
+        var activeKeys = roomManager.getActiveClientKeys(roomId);
+        if (activeKeys.isEmpty()) {
+            if (roomManager.getRoom(roomId) == null) {
+                log.warn("broadcastToRoom called for unknown roomId='{}'", roomId);
+            }
             return;
         }
 
         List<SelectionKey> toClose = new ArrayList<>();
         int recipientCount = 0;
 
-        for (SelectionKey key : room.getActiveKeys()) {
+        for (SelectionKey key : activeKeys) {
             if (!key.isValid() || key == senderKey) {
                 continue;
             }
@@ -525,11 +608,13 @@ public final class NioServer implements Runnable {
         Object attachment = key.attachment();
 
         if (attachment instanceof ClientSession s) {
-            // Remove from the room's active-key set before cancelling the key.
-            if (!s.roomId.isBlank()) {
+            if (roomManager.isInLobby(key)) {
+                roomManager.removeFromLobby(key);
+            } else if (!s.roomId.isBlank()) {
                 roomManager.removeClientFromRoom(s.roomId, key);
             }
-            log.info("Closing channel  session={} room='{}'", s.sessionId, s.roomId);
+            log.info("Closing channel  session={} room='{}'", s.sessionId,
+                    s.roomId.isBlank() ? "(lobby)" : s.roomId);
         } else {
             log.info("Closing server channel");
         }
