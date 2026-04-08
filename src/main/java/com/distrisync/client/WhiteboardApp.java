@@ -17,7 +17,7 @@ import javafx.scene.canvas.GraphicsContext;
 import javafx.scene.control.Button;
 import javafx.scene.control.ColorPicker;
 import javafx.scene.control.Label;
-import javafx.scene.control.Separator;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.Slider;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TextInputDialog;
@@ -26,6 +26,7 @@ import javafx.scene.control.ToggleGroup;
 import javafx.scene.control.Tooltip;
 import javafx.scene.input.KeyCode;
 import javafx.util.Duration;
+import javafx.scene.Parent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
@@ -136,10 +137,18 @@ public class WhiteboardApp extends Application {
     private NetworkClient     networkClient;
     private UdpPointerTracker udpTracker;
 
-    // ── user identity and room (captured at startup via dialogs) ─────────────
+    // ── user identity (name from dialog); room title updated after JOIN_ROOM ─
     private String authorName = "Anonymous";
     private String clientId   = UUID.randomUUID().toString();
-    private String roomId     = "Global";
+    private String roomId     = "";
+
+    // ── two-scene state machine: lobby ↔ canvas ──────────────────────────────
+    private Stage   primaryStage;
+    private Scene   lobbyScene;
+    private Scene   canvasScene;
+    private VBox    lobbyRoomList;
+    private Label   lobbyStatusLabel;
+    private TextField newRoomField;
 
     /**
      * LIFO history of shape IDs committed by this local user during the current
@@ -190,18 +199,8 @@ public class WhiteboardApp extends Application {
         authorName = rawName.isBlank() ? "Anonymous" : rawName;
         clientId   = UUID.randomUUID().toString();
 
-        // Prompt for the room to join before the network connection is opened
-        // so that the roomId is available when sendHandshake() is called.
-        TextInputDialog roomDialog = new TextInputDialog("Global");
-        roomDialog.setTitle("DistriSync – Room");
-        roomDialog.setHeaderText("Join a Collaborative Room");
-        roomDialog.setContentText("Room ID:");
-        roomDialog.getDialogPane().setStyle("-fx-background-color: #1e1e2e; -fx-font-size: 13px;");
-        Optional<String> roomResult = roomDialog.showAndWait();
-        String rawRoom = roomResult.orElse("Global").strip();
-        roomId = rawRoom.isBlank() ? "Global" : rawRoom;
-
-        stage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
+        primaryStage = stage;
+        stage.setTitle("DistriSync – Lobby");
 
         // ── Layer 1: base canvas ──────────────────────────────────────────────
         baseCanvas = new Canvas();
@@ -257,17 +256,21 @@ public class WhiteboardApp extends Application {
             "-fx-background-color: #313244; -fx-text-fill: #cdd6f4;" +
             "-fx-font-size: 12px; -fx-padding: 5 9; -fx-background-radius: 6;");
 
-        Scene scene = new Scene(root, 1280, 860);
-        scene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+        canvasScene = new Scene(root, 1280, 860);
+        canvasScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
 
-        // ── Ctrl+Z keyboard shortcut for undo ─────────────────────────────────
-        scene.setOnKeyPressed(e -> {
+        // ── Ctrl+Z keyboard shortcut for undo (canvas scene only) ─────────────
+        canvasScene.setOnKeyPressed(e -> {
             if (e.isControlDown() && e.getCode() == KeyCode.Z) {
                 undoLastShape();
             }
         });
 
-        stage.setScene(scene);
+        Parent lobbyRoot = buildLobbyRoot();
+        lobbyScene = new Scene(lobbyRoot, 960, 640);
+        lobbyScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+
+        stage.setScene(lobbyScene);
         stage.show();
 
         // controlPane must sit above cursorPane; toFront() reaffirms StackPane z-order.
@@ -383,7 +386,12 @@ public class WhiteboardApp extends Application {
         clearBtn.getStyleClass().add("danger-button");
         clearBtn.setOnAction(e -> clearBoard());
 
-        VBox actionsSection = new VBox(10, undoBtn, clearBtn);
+        Button leaveRoomBtn = new Button("Leave Room");
+        leaveRoomBtn.setMaxWidth(Double.MAX_VALUE);
+        leaveRoomBtn.getStyleClass().add("danger-button");
+        leaveRoomBtn.setOnAction(e -> leaveCanvasRoom());
+
+        VBox actionsSection = new VBox(10, undoBtn, clearBtn, leaveRoomBtn);
 
         // ── Status label — Region spacer pushes it to the absolute bottom ─────
         statusLabel = new Label("⬤ Offline");
@@ -421,6 +429,129 @@ public class WhiteboardApp extends Application {
         Label l = new Label(text);
         l.getStyleClass().add("section-header");
         return l;
+    }
+
+    // =========================================================================
+    // Lobby scene
+    // =========================================================================
+
+    private Parent buildLobbyRoot() {
+        VBox root = new VBox(16);
+        root.setPadding(new Insets(28));
+        root.setMaxWidth(Double.MAX_VALUE);
+        root.setMaxHeight(Double.MAX_VALUE);
+        root.getStyleClass().add("lobby-root");
+
+        Label header = new Label("DistriSync Lobby");
+        header.getStyleClass().add("lobby-header");
+        header.setMaxWidth(Double.MAX_VALUE);
+
+        Label subtitle = new Label("Join an active room or create a new one.");
+        subtitle.getStyleClass().add("lobby-subtitle");
+        subtitle.setWrapText(true);
+        subtitle.setMaxWidth(Double.MAX_VALUE);
+
+        lobbyRoomList = new VBox(10);
+        lobbyRoomList.setFillWidth(true);
+
+        ScrollPane scroll = new ScrollPane(lobbyRoomList);
+        scroll.setFitToWidth(true);
+        scroll.setMinHeight(220);
+        scroll.getStyleClass().add("lobby-scroll");
+        VBox.setVgrow(scroll, Priority.ALWAYS);
+
+        newRoomField = new TextField();
+        newRoomField.setPromptText("New room name…");
+        newRoomField.getStyleClass().add("lobby-textfield");
+
+        Button createBtn = new Button("Create Room");
+        createBtn.getStyleClass().add("tool-button");
+        createBtn.setOnAction(e -> {
+            String name = newRoomField.getText() != null ? newRoomField.getText().strip() : "";
+            if (name.isBlank() || networkClient == null || !networkClient.isRunning()) {
+                return;
+            }
+            networkClient.sendJoinRoom(name);
+        });
+
+        HBox createRow = new HBox(12, newRoomField, createBtn);
+        createRow.setAlignment(Pos.CENTER_LEFT);
+        HBox.setHgrow(newRoomField, Priority.ALWAYS);
+
+        lobbyStatusLabel = new Label("Connecting…");
+        lobbyStatusLabel.setWrapText(true);
+        lobbyStatusLabel.setMaxWidth(Double.MAX_VALUE);
+        lobbyStatusLabel.getStyleClass().add("lobby-status-muted");
+
+        root.getChildren().addAll(header, subtitle, scroll, createRow, lobbyStatusLabel);
+        return root;
+    }
+
+    private void refreshLobbyRooms(List<RoomInfo> rooms) {
+        if (lobbyRoomList == null) {
+            return;
+        }
+        lobbyRoomList.getChildren().clear();
+        for (RoomInfo info : rooms) {
+            HBox card = new HBox(16);
+            card.setAlignment(Pos.CENTER_LEFT);
+            card.getStyleClass().add("lobby-card");
+
+            VBox textCol = new VBox(4);
+            Label idLab = new Label(info.roomId());
+            idLab.getStyleClass().add("lobby-room-title");
+            Label countLab = new Label(
+                    info.userCount() + (info.userCount() == 1 ? " user connected" : " users connected"));
+            countLab.getStyleClass().add("lobby-meta");
+            textCol.getChildren().addAll(idLab, countLab);
+            HBox.setHgrow(textCol, Priority.ALWAYS);
+
+            Button joinBtn = new Button("Join");
+            joinBtn.getStyleClass().add("tool-button");
+            String rid = info.roomId();
+            joinBtn.setOnAction(e -> {
+                if (networkClient != null && networkClient.isRunning()) {
+                    networkClient.sendJoinRoom(rid);
+                }
+            });
+
+            card.getChildren().addAll(textCol, joinBtn);
+            lobbyRoomList.getChildren().add(card);
+        }
+    }
+
+    private void clearLocalCanvasState() {
+        dismissActiveTextField();
+        shapes.clear();
+        undoHistory.clear();
+        transientShapes.clear();
+        for (VBox ghost : ghostTextNodes.values()) {
+            cursorPane.getChildren().remove(ghost);
+        }
+        ghostTextNodes.clear();
+        activeShapeId = null;
+        lastSendTime = 0;
+        isDragging = false;
+        freehandPoints.clear();
+        double rw = remoteTransientCanvas.getWidth();
+        double rh = remoteTransientCanvas.getHeight();
+        double tw = transientCanvas.getWidth();
+        double th = transientCanvas.getHeight();
+        remoteTransientGc.clearRect(0, 0, Math.max(rw, 1), Math.max(rh, 1));
+        transientGc.clearRect(0, 0, Math.max(tw, 1), Math.max(th, 1));
+        redrawBaseCanvas(shapes.values());
+    }
+
+    private void leaveCanvasRoom() {
+        if (networkClient != null) {
+            networkClient.sendLeaveRoom();
+        }
+        clearLocalCanvasState();
+        if (primaryStage != null && lobbyScene != null) {
+            primaryStage.setScene(lobbyScene);
+            primaryStage.setTitle("DistriSync – Lobby");
+        }
+        setStatus("⬤ In lobby", FG_MUTED);
     }
 
     // =========================================================================
@@ -956,7 +1087,9 @@ public class WhiteboardApp extends Application {
         String host = raw.size() > 0 ? raw.get(0) : DEFAULT_HOST;
         int    port = raw.size() > 1 ? parseInt(raw.get(1), DEFAULT_PORT) : DEFAULT_PORT;
 
-        networkClient = new NetworkClient(host, port, authorName, clientId, roomId);
+        networkClient = new NetworkClient(host, port, authorName, clientId);
+        networkClient.addLobbyListener(rooms ->
+                Platform.runLater(() -> refreshLobbyRooms(rooms)));
 
         // Callbacks arrive on distrisync-read; marshal to FX thread before touching state
         networkClient.addListener(new CanvasUpdateListener() {
@@ -967,6 +1100,14 @@ public class WhiteboardApp extends Application {
                     shapes.clear();
                     incoming.forEach(s -> shapes.put(s.objectId(), s));
                     redrawBaseCanvas(shapes.values());
+                    if (primaryStage != null && lobbyScene != null
+                            && primaryStage.getScene() == lobbyScene) {
+                        roomId = networkClient != null ? networkClient.getActiveRoomId() : "";
+                        primaryStage.setScene(canvasScene);
+                        primaryStage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
+                        controlPane.toFront();
+                        setStatus("⬤ Connected", GREEN);
+                    }
                     log.info("Snapshot applied — {} shape(s) on canvas", shapes.size());
                 });
             }
@@ -1084,10 +1225,23 @@ public class WhiteboardApp extends Application {
         Thread connectThread = new Thread(() -> {
             try {
                 networkClient.connect();
-                Platform.runLater(() -> setStatus("⬤ Connected to " + host + ":" + port, GREEN));
+                Platform.runLater(() -> {
+                    if (lobbyStatusLabel != null) {
+                        lobbyStatusLabel.setText("Connected to " + host + ":" + port);
+                        lobbyStatusLabel.getStyleClass().clear();
+                        lobbyStatusLabel.getStyleClass().add("lobby-status-connected");
+                    }
+                });
             } catch (IOException e) {
                 log.warn("Could not reach server at {}:{} — offline mode active", host, port);
-                Platform.runLater(() -> setStatus("⬤ Offline", RED));
+                Platform.runLater(() -> {
+                    if (lobbyStatusLabel != null) {
+                        lobbyStatusLabel.setText("Offline — start the server or check host/port");
+                        lobbyStatusLabel.getStyleClass().clear();
+                        lobbyStatusLabel.getStyleClass().add("lobby-status-disconnected");
+                    }
+                    setStatus("⬤ Offline", RED);
+                });
             }
         }, "distrisync-connect");
         connectThread.setDaemon(true);

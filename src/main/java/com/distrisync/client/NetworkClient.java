@@ -65,8 +65,10 @@ import java.util.concurrent.locks.LockSupport;
  * <pre>{@code
  * NetworkClient client = new NetworkClient("localhost", 9090);
  * client.addListener(myCanvasListener);
- * client.connect();                        // blocks until first handshake sent
- * client.sendMutation(someShape);          // enqueued; async dispatch
+ * client.addLobbyListener(myLobbyListener);
+ * client.connect();                        // handshake → lobby; LOBBY_STATE pushed by server
+ * client.sendJoinRoom("MyRoom");          // async; SNAPSHOT follows when joined
+ * client.sendMutation(someShape);         // enqueued; async dispatch
  * client.close();                          // graceful shutdown
  * }</pre>
  */
@@ -97,10 +99,18 @@ public final class NetworkClient implements AutoCloseable {
     private final int    port;
     private final String authorName;
     private final String clientId;
-    private final String roomId;
+
+    /**
+     * Room id used for {@code JOIN_ROOM} on reconnect. Empty while the client
+     * is in the lobby (after handshake / {@code LEAVE_ROOM}).
+     */
+    private volatile String activeRoomId = "";
 
     /** Thread-safe listener registry; copy-on-write for lock-free iteration. */
     private final CopyOnWriteArrayList<CanvasUpdateListener> listeners =
+            new CopyOnWriteArrayList<>();
+
+    private final CopyOnWriteArrayList<LobbyUpdateListener> lobbyListeners =
             new CopyOnWriteArrayList<>();
 
     /**
@@ -132,21 +142,21 @@ public final class NetworkClient implements AutoCloseable {
 
     /**
      * Creates an anonymous {@code NetworkClient} targeting the given server endpoint.
-     * Attribution and room fields default to empty / random UUID / "Global".
-     * Call {@link #connect()} to establish the connection.
+     * Attribution defaults to empty author name and a random {@code clientId}.
+     * Call {@link #connect()} for the lobby, then {@link #sendJoinRoom(String)}.
      *
      * @param host server host name or IP; must not be blank
      * @param port server TCP port; must be in [1, 65535]
      */
     public NetworkClient(String host, int port) {
-        this(host, port, "", java.util.UUID.randomUUID().toString(), "Global");
+        this(host, port, "", java.util.UUID.randomUUID().toString());
     }
 
     /**
      * Creates an attributed {@code NetworkClient} targeting the given server endpoint.
      * The {@code authorName} and {@code clientId} are embedded in the {@code HANDSHAKE}
-     * frame and attached to every shape the client mutates.  The client joins the
-     * {@code "Global"} room.
+     * frame and attached to every shape the client mutates.  After {@link #connect()}
+     * the client stays in the lobby until {@link #sendJoinRoom(String)}.
      *
      * @param host       server host name or IP; must not be blank
      * @param port       server TCP port; must be in [1, 65535]
@@ -154,20 +164,6 @@ public final class NetworkClient implements AutoCloseable {
      * @param clientId   stable session identifier; may be empty but not {@code null}
      */
     public NetworkClient(String host, int port, String authorName, String clientId) {
-        this(host, port, authorName, clientId, "Global");
-    }
-
-    /**
-     * Creates a fully attributed {@code NetworkClient} that joins the specified room.
-     *
-     * @param host       server host name or IP; must not be blank
-     * @param port       server TCP port; must be in [1, 65535]
-     * @param authorName human-readable display name; may be empty but not {@code null}
-     * @param clientId   stable session identifier; may be empty but not {@code null}
-     * @param roomId     the collaborative room to join; defaults to {@code "Global"}
-     *                   if {@code null} or blank
-     */
-    public NetworkClient(String host, int port, String authorName, String clientId, String roomId) {
         if (host == null || host.isBlank())
             throw new IllegalArgumentException("host must not be blank");
         if (port < 1 || port > 65_535)
@@ -176,8 +172,6 @@ public final class NetworkClient implements AutoCloseable {
         this.port       = port;
         this.authorName = authorName != null ? authorName : "";
         this.clientId   = clientId   != null ? clientId   : "";
-        String rid      = roomId != null ? roomId.strip() : "";
-        this.roomId     = rid.isBlank() ? "Global" : rid;
     }
 
     // =========================================================================
@@ -187,7 +181,9 @@ public final class NetworkClient implements AutoCloseable {
     /**
      * Establishes the initial TCP connection using the reconnect backoff
      * strategy, sends the {@code HANDSHAKE} frame, and starts the read and
-     * write daemon threads.
+     * write daemon threads. The server places the client in the lobby and may
+     * push {@code LOBBY_STATE}; call {@link #sendJoinRoom(String)} to enter a room
+     * and receive {@code SNAPSHOT}.
      *
      * <p>This method is idempotent only for the first call; subsequent calls
      * throw {@link IllegalStateException}.
@@ -200,10 +196,22 @@ public final class NetworkClient implements AutoCloseable {
         if (!running.compareAndSet(false, true)) {
             throw new IllegalStateException("NetworkClient is already connected");
         }
-        channel = connectWithBackoff();
-        sendHandshake();
-        startWriteThread();
-        startReadThread();
+        try {
+            channel = connectWithBackoff();
+            sendHandshake();
+            startWriteThread();
+            startReadThread();
+        } catch (IOException e) {
+            running.set(false);
+            SocketChannel ch = channel;
+            channel = null;
+            if (ch != null) {
+                try {
+                    ch.close();
+                } catch (IOException ignored) { /* best-effort */ }
+            }
+            throw e;
+        }
     }
 
     /**
@@ -331,6 +339,19 @@ public final class NetworkClient implements AutoCloseable {
         return clientId;
     }
 
+    /**
+     * Last room passed to {@link #sendJoinRoom(String)}; empty in the lobby
+     * (including immediately after {@link #sendLeaveRoom()}).
+     */
+    public String getActiveRoomId() {
+        return activeRoomId;
+    }
+
+    /** {@code true} while TCP I/O threads are running after a successful {@link #connect()}. */
+    public boolean isRunning() {
+        return running.get();
+    }
+
     /** Adds {@code frame} to the write queue and unparks the write thread. */
     private void enqueueFrame(ByteBuffer frame) {
         writeQueue.offer(frame);
@@ -355,6 +376,18 @@ public final class NetworkClient implements AutoCloseable {
      */
     public void removeListener(CanvasUpdateListener listener) {
         if (listener != null) listeners.remove(listener);
+    }
+
+    /**
+     * Registers a listener for {@code LOBBY_STATE} frames. Duplicate registrations
+     * are ignored.
+     */
+    public void addLobbyListener(LobbyUpdateListener listener) {
+        if (listener != null) lobbyListeners.addIfAbsent(listener);
+    }
+
+    public void removeLobbyListener(LobbyUpdateListener listener) {
+        if (listener != null) lobbyListeners.remove(listener);
     }
 
     /**
@@ -442,12 +475,48 @@ public final class NetworkClient implements AutoCloseable {
      * after a reconnect), so no locking is required here.
      */
     private void sendHandshake() throws IOException {
-        record HandshakePayload(String authorName, String clientId, String roomId) {}
-        ByteBuffer handshake = MessageCodec.encodeObject(
-                MessageType.HANDSHAKE, new HandshakePayload(authorName, clientId, roomId));
+        ByteBuffer handshake = MessageCodec.encodeHandshake(authorName, clientId);
         writeBlocking(channel, handshake);
-        log.debug("HANDSHAKE sent to {}:{} authorName='{}' clientId='{}' roomId='{}'",
-                host, port, authorName, clientId, roomId);
+        log.debug("HANDSHAKE sent to {}:{} authorName='{}' clientId='{}'",
+                host, port, authorName, clientId);
+    }
+
+    /**
+     * Enters a canvas room (async). The server responds with {@code SNAPSHOT}.
+     * Updates {@link #getActiveRoomId()} for reconnect semantics.
+     *
+     * @param roomId non-blank room identifier
+     */
+    public void sendJoinRoom(String roomId) {
+        if (!running.get()) return;
+        String rid = roomId != null ? roomId.strip() : "";
+        if (rid.isBlank()) {
+            log.debug("sendJoinRoom ignored — blank roomId");
+            return;
+        }
+        activeRoomId = rid;
+        enqueueFrame(MessageCodec.encodeJoinRoom(rid));
+        log.debug("JOIN_ROOM enqueued roomId='{}'", rid);
+    }
+
+    /**
+     * Blocking {@code JOIN_ROOM} for the reconnect path only (write thread not used).
+     */
+    private void sendJoinRoomBlocking(String roomId) throws IOException {
+        ByteBuffer frame = MessageCodec.encodeJoinRoom(roomId);
+        writeBlocking(channel, frame);
+        log.debug("JOIN_ROOM sent (blocking) to {}:{} roomId='{}'", host, port, roomId);
+    }
+
+    /**
+     * Requests to leave the current canvas room and return to the lobby.
+     * No-op when not connected.
+     */
+    public void sendLeaveRoom() {
+        if (!running.get()) return;
+        activeRoomId = "";
+        enqueueFrame(MessageCodec.encodeLeaveRoom());
+        log.debug("LEAVE_ROOM enqueued");
     }
 
     /**
@@ -480,7 +549,13 @@ public final class NetworkClient implements AutoCloseable {
         }
         channel = connectWithBackoff();
         sendHandshake();
-        log.info("Reconnected to {}:{} and HANDSHAKE re-sent", host, port);
+        String rid = activeRoomId;
+        if (rid != null && !rid.isBlank()) {
+            sendJoinRoomBlocking(rid);
+            log.info("Reconnected to {}:{} — HANDSHAKE + JOIN_ROOM roomId='{}'", host, port, rid);
+        } else {
+            log.info("Reconnected to {}:{} — HANDSHAKE (lobby)", host, port);
+        }
     }
 
     // =========================================================================
@@ -662,6 +737,20 @@ public final class NetworkClient implements AutoCloseable {
                     log.debug("Malformed TEXT_UPDATE payload ignored: {}", e.getMessage());
                 }
             }
+            case LOBBY_STATE -> {
+                try {
+                    var entries = MessageCodec.decodeLobbyState(msg);
+                    log.debug("LOBBY_STATE received  rooms={}", entries.size());
+                    List<RoomInfo> rooms = RoomInfo.copyOf(entries);
+                    for (LobbyUpdateListener listener : lobbyListeners) {
+                        listener.onLobbyUpdated(rooms);
+                    }
+                } catch (Exception e) {
+                    log.debug("Malformed LOBBY_STATE ignored: {}", e.getMessage());
+                }
+            }
+            case JOIN_ROOM, LEAVE_ROOM ->
+                    log.trace("Ignoring echoed client-bound message type: {}", msg.type());
             default -> log.trace("Ignoring server-bound message type: {}", msg.type());
         }
     }

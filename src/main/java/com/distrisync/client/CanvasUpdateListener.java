@@ -1,7 +1,6 @@
 package com.distrisync.client;
 
 import com.distrisync.model.Shape;
-
 import java.util.List;
 import java.util.UUID;
 
