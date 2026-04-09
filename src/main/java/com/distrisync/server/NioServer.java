@@ -470,7 +470,10 @@ public final class NioServer implements Runnable {
                 room.roomId, shapes.size(), frame.remaining(), session.sessionId);
 
         session.enqueue(frame);
-        flushWriteQueue(session, key);
+        if (!flushWriteQueue(session, key)) {
+            log.error("SNAPSHOT flush failed for session={} — closing connection", session.sessionId);
+            closeKey(key);
+        }
     }
 
     // =========================================================================

@@ -82,8 +82,15 @@ public final class NetworkClient implements AutoCloseable {
     /** Maximum number of reconnect attempts before the client gives up. */
     private static final int MAX_RECONNECT_ATTEMPTS = 5;
 
-    /** Read accumulation buffer capacity per channel (64 KiB). */
-    private static final int READ_BUFFER_CAPACITY = 64 * 1024;
+    /**
+     * Read accumulation buffer capacity per channel.
+     *
+     * Must be able to hold the largest single frame in one contiguous buffer.
+     * Snapshots for rooms with many persisted shapes can exceed 64 KiB, so use
+     * protocol max payload + header to avoid permanent partial-frame stalls.
+     */
+    private static final int READ_BUFFER_CAPACITY =
+            MessageCodec.MAX_PAYLOAD_BYTES + MessageCodec.HEADER_BYTES;
 
     /** Max idle park duration for the write thread (5 ms). */
     private static final long WRITE_PARK_NANOS = 5_000_000L;
@@ -124,6 +131,19 @@ public final class NetworkClient implements AutoCloseable {
     private final AtomicBoolean running = new AtomicBoolean(false);
 
     /**
+     * Set after the first post-handshake server message ({@code LOBBY_STATE} or
+     * {@code SNAPSHOT}). {@code JOIN_ROOM} must not hit the wire before then or
+     * the server may still be processing {@code HANDSHAKE} and will drop the join.
+     */
+    private final AtomicBoolean protocolReady = new AtomicBoolean(false);
+
+    /**
+     * If {@link #sendJoinRoom} runs before {@link #protocolReady}, the room id is
+     * held here and sent when {@link #noteProtocolReady} runs.
+     */
+    private volatile String deferredJoinRoomId = "";
+
+    /**
      * Reference to the write daemon thread so that producers can
      * {@link LockSupport#unpark} it when new work is enqueued.
      */
@@ -135,6 +155,12 @@ public final class NetworkClient implements AutoCloseable {
      * most recent value without acquiring a lock.
      */
     private volatile SocketChannel channel;
+
+    /**
+     * Serialises every outbound {@link SocketChannel#write} so handshake / reconnect
+     * and the async write thread cannot interleave partial frames on the wire.
+     */
+    private final Object writeLock = new Object();
 
     // =========================================================================
     // Construction
@@ -197,6 +223,8 @@ public final class NetworkClient implements AutoCloseable {
             throw new IllegalStateException("NetworkClient is already connected");
         }
         try {
+            protocolReady.set(false);
+            deferredJoinRoomId = "";
             channel = connectWithBackoff();
             sendHandshake();
             startWriteThread();
@@ -472,11 +500,11 @@ public final class NetworkClient implements AutoCloseable {
      * The payload carries {@code authorName} and {@code clientId} so the server
      * can associate subsequent mutations with the originating user.
      * This always completes before the I/O threads are started (or restarted
-     * after a reconnect), so no locking is required here.
+     * after a reconnect). Uses {@link #writeFully} so it never races the write thread.
      */
     private void sendHandshake() throws IOException {
         ByteBuffer handshake = MessageCodec.encodeHandshake(authorName, clientId);
-        writeBlocking(channel, handshake);
+        writeFully(handshake);
         log.debug("HANDSHAKE sent to {}:{} authorName='{}' clientId='{}'",
                 host, port, authorName, clientId);
     }
@@ -495,8 +523,13 @@ public final class NetworkClient implements AutoCloseable {
             return;
         }
         activeRoomId = rid;
-        enqueueFrame(MessageCodec.encodeJoinRoom(rid));
-        log.debug("JOIN_ROOM enqueued roomId='{}'", rid);
+        if (protocolReady.get()) {
+            enqueueFrame(MessageCodec.encodeJoinRoom(rid));
+            log.debug("JOIN_ROOM enqueued roomId='{}'", rid);
+        } else {
+            deferredJoinRoomId = rid;
+            log.debug("JOIN_ROOM deferred until protocol ready roomId='{}'", rid);
+        }
     }
 
     /**
@@ -504,8 +537,8 @@ public final class NetworkClient implements AutoCloseable {
      */
     private void sendJoinRoomBlocking(String roomId) throws IOException {
         ByteBuffer frame = MessageCodec.encodeJoinRoom(roomId);
-        writeBlocking(channel, frame);
-        log.debug("JOIN_ROOM sent (blocking) to {}:{} roomId='{}'", host, port, roomId);
+        writeFully(frame);
+        log.info("JOIN_ROOM sent (blocking) to {}:{} roomId='{}'", host, port, roomId);
     }
 
     /**
@@ -520,12 +553,19 @@ public final class NetworkClient implements AutoCloseable {
     }
 
     /**
-     * Writes {@code buf} entirely to {@code ch}, spinning on partial writes
-     * (which can occur when the OS send-buffer is momentarily full).
+     * Writes the entire buffer to {@link #channel} under {@link #writeLock},
+     * spinning on partial writes (blocking channel).
      */
-    private static void writeBlocking(SocketChannel ch, ByteBuffer buf) throws IOException {
-        while (buf.hasRemaining()) {
-            ch.write(buf);
+    private void writeFully(ByteBuffer buf) throws IOException {
+        ByteBuffer dup = buf.duplicate();
+        synchronized (writeLock) {
+            SocketChannel ch = channel;
+            if (ch == null) {
+                throw new IOException("SocketChannel is null");
+            }
+            while (dup.hasRemaining()) {
+                ch.write(dup);
+            }
         }
     }
 
@@ -543,6 +583,8 @@ public final class NetworkClient implements AutoCloseable {
      * @throws IOException if all reconnect attempts are exhausted
      */
     private synchronized void reconnect() throws IOException {
+        protocolReady.set(false);
+        deferredJoinRoomId = "";
         SocketChannel stale = channel;
         if (stale != null) {
             try { stale.close(); } catch (IOException ignored) {}
@@ -552,6 +594,7 @@ public final class NetworkClient implements AutoCloseable {
         String rid = activeRoomId;
         if (rid != null && !rid.isBlank()) {
             sendJoinRoomBlocking(rid);
+            protocolReady.set(true);
             log.info("Reconnected to {}:{} — HANDSHAKE + JOIN_ROOM roomId='{}'", host, port, rid);
         } else {
             log.info("Reconnected to {}:{} — HANDSHAKE (lobby)", host, port);
@@ -637,21 +680,59 @@ public final class NetworkClient implements AutoCloseable {
                 // Buffer holds a partial frame; position was reset by the codec.
                 // The outer readLoop will compact and read more bytes.
                 break;
+            } catch (RuntimeException e) {
+                log.error("Protocol decode/dispatch failed — forcing reconnect: {}", e.getMessage(), e);
+                try {
+                    handleDisconnect("protocol error");
+                } catch (RuntimeException fatal) {
+                    running.set(false);
+                    throw fatal;
+                }
+                break;
             }
+        }
+    }
+
+    /**
+     * First server message after handshake proves the session is live; flush any
+     * deferred {@code JOIN_ROOM} queued from the UI before this point.
+     */
+    private void noteProtocolReady() {
+        if (!protocolReady.compareAndSet(false, true)) {
+            return;
+        }
+        String rid = deferredJoinRoomId;
+        deferredJoinRoomId = "";
+        if (rid != null && !rid.isBlank()) {
+            enqueueFrame(MessageCodec.encodeJoinRoom(rid));
+            log.debug("Flushed deferred JOIN_ROOM roomId='{}'", rid);
         }
     }
 
     private void dispatchMessage(Message msg) {
         switch (msg.type()) {
             case SNAPSHOT -> {
-                List<Shape> shapes = ClientShapeCodec.decodeSnapshot(msg.payload());
-                log.debug("SNAPSHOT received: {} shape(s)", shapes.size());
+                List<Shape> shapes;
+                try {
+                    shapes = ClientShapeCodec.decodeSnapshot(msg.payload());
+                } catch (Exception e) {
+                    log.error("SNAPSHOT decode failed — ignoring frame: {}", e.getMessage(), e);
+                    break;
+                }
+                noteProtocolReady();
+                log.info("SNAPSHOT received: {} shape(s)", shapes.size());
                 for (CanvasUpdateListener listener : listeners) {
                     listener.onSnapshotReceived(shapes);
                 }
             }
             case MUTATION -> {
-                Shape shape = ClientShapeCodec.decodeMutation(msg.payload());
+                Shape shape;
+                try {
+                    shape = ClientShapeCodec.decodeMutation(msg.payload());
+                } catch (Exception e) {
+                    log.warn("MUTATION decode failed — ignoring: {}", e.getMessage());
+                    break;
+                }
                 log.debug("MUTATION received: objectId={}", shape.objectId());
                 for (CanvasUpdateListener listener : listeners) {
                     listener.onMutationReceived(shape);
@@ -740,6 +821,7 @@ public final class NetworkClient implements AutoCloseable {
             case LOBBY_STATE -> {
                 try {
                     var entries = MessageCodec.decodeLobbyState(msg);
+                    noteProtocolReady();
                     log.debug("LOBBY_STATE received  rooms={}", entries.size());
                     List<RoomInfo> rooms = RoomInfo.copyOf(entries);
                     for (LobbyUpdateListener listener : lobbyListeners) {
@@ -751,7 +833,8 @@ public final class NetworkClient implements AutoCloseable {
             }
             case JOIN_ROOM, LEAVE_ROOM ->
                     log.trace("Ignoring echoed client-bound message type: {}", msg.type());
-            default -> log.trace("Ignoring server-bound message type: {}", msg.type());
+            default -> log.warn("Ignoring unexpected inbound message type={} — check client/server versions",
+                    msg.type());
         }
     }
 
@@ -802,7 +885,12 @@ public final class NetworkClient implements AutoCloseable {
             }
 
             try {
-                writeBlocking(channel, frame);
+                byte wireType = frame.get(0);
+                writeFully(frame);
+                if (wireType == MessageType.JOIN_ROOM.wireCode()) {
+                    log.info("JOIN_ROOM written on TCP ({} bytes) — awaiting SNAPSHOT from server",
+                            frame.limit());
+                }
             } catch (IOException e) {
                 if (!running.get()) break;
                 log.warn("Write failed (channel may have dropped): {}; re-queuing frame", e.getMessage());

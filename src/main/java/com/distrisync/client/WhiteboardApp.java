@@ -6,6 +6,7 @@ import com.distrisync.model.Line;
 import com.distrisync.model.Shape;
 import com.distrisync.model.TextNode;
 import javafx.animation.AnimationTimer;
+import javafx.animation.PauseTransition;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
@@ -87,7 +88,8 @@ public class WhiteboardApp extends Application {
     private static final Logger log = LoggerFactory.getLogger(WhiteboardApp.class);
 
     // ── server defaults ───────────────────────────────────────────────────────
-    private static final String DEFAULT_HOST = "localhost";
+    /** Prefer IPv4 loopback on Windows to avoid ::1 vs 127.0.0.1 split with some servers. */
+    private static final String DEFAULT_HOST = "127.0.0.1";
     private static final int    DEFAULT_PORT = 9090;
 
     // ── Catppuccin Mocha / dark palette ───────────────────────────────────────
@@ -136,20 +138,30 @@ public class WhiteboardApp extends Application {
     // ── network subsystems ────────────────────────────────────────────────────
     private NetworkClient     networkClient;
     private UdpPointerTracker udpTracker;
+    /** Endpoint last passed to {@link NetworkClient} (for lobby error text). */
+    private String            networkHost = DEFAULT_HOST;
+    private int               networkPort = DEFAULT_PORT;
+    /** Fires if we stay on the lobby after requesting a room join (no SNAPSHOT). */
+    private PauseTransition   lobbyJoinWatchdog;
 
     // ── user identity (name from dialog); room title updated after JOIN_ROOM ─
     private String authorName = "Anonymous";
     private String clientId   = UUID.randomUUID().toString();
     private String roomId     = "";
 
-    // ── two-scene state machine: lobby ↔ canvas ──────────────────────────────
+    // ── two-scene state machine: login → lobby ↔ canvas ───────────────────────
     private Stage   primaryStage;
+    private Scene   loginScene;
     private Scene   lobbyScene;
     private Scene   canvasScene;
     private VBox    lobbyRoomList;
     private Label   lobbyEmptyStateLabel;
     private Label   lobbyStatusLabel;
     private TextField newRoomField;
+
+    /** Debounce duplicate lobby join/create clicks (same room, short window). */
+    private long   lastLobbyJoinMillis;
+    private String lastLobbyJoinRoomId = "";
 
     /**
      * LIFO history of shape IDs committed by this local user during the current
@@ -300,7 +312,7 @@ public class WhiteboardApp extends Application {
 
         loginRoot.getChildren().add(loginCard);
 
-        Scene loginScene = new Scene(loginRoot, shellW, shellH);
+        loginScene = new Scene(loginRoot, shellW, shellH);
         loginScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
 
         Runnable attemptJoin = () -> {
@@ -523,13 +535,8 @@ public class WhiteboardApp extends Application {
 
         Button createBtn = new Button("Create Room");
         createBtn.getStyleClass().add("tool-button");
-        createBtn.setOnAction(e -> {
-            String name = newRoomField.getText() != null ? newRoomField.getText().strip() : "";
-            if (name.isBlank() || networkClient == null || !networkClient.isRunning()) {
-                return;
-            }
-            networkClient.sendJoinRoom(name);
-        });
+        createBtn.setOnAction(e -> joinRoomFromLobby(newRoomField.getText()));
+        newRoomField.setOnAction(e -> joinRoomFromLobby(newRoomField.getText()));
 
         HBox createRow = new HBox(12, newRoomField, createBtn);
         createRow.setAlignment(Pos.CENTER_LEFT);
@@ -566,6 +573,71 @@ public class WhiteboardApp extends Application {
         return root;
     }
 
+    /**
+     * Joins or creates a room by id (lobby UI). No-op if disconnected or blank.
+     */
+    private void joinRoomFromLobby(String roomIdOrName) {
+        String name = roomIdOrName != null ? roomIdOrName.strip() : "";
+        if (name.isBlank()) {
+            return;
+        }
+        if (networkClient == null || !networkClient.isRunning()) {
+            if (lobbyStatusLabel != null) {
+                lobbyStatusLabel.setText("Not connected — start the server or wait for connection.");
+                lobbyStatusLabel.getStyleClass().clear();
+                lobbyStatusLabel.getStyleClass().add("lobby-status-disconnected");
+            }
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (name.equals(lastLobbyJoinRoomId) && (now - lastLobbyJoinMillis) < 500) {
+            return;
+        }
+        lastLobbyJoinMillis = now;
+        lastLobbyJoinRoomId = name;
+        if (lobbyStatusLabel != null) {
+            lobbyStatusLabel.setText("Joining room \"" + name + "\"…");
+            lobbyStatusLabel.getStyleClass().clear();
+            lobbyStatusLabel.getStyleClass().add("lobby-status-muted");
+        }
+        networkClient.sendJoinRoom(name);
+        scheduleLobbyJoinWatchdog();
+    }
+
+    private void cancelLobbyJoinWatchdog() {
+        if (lobbyJoinWatchdog != null) {
+            lobbyJoinWatchdog.stop();
+            lobbyJoinWatchdog = null;
+        }
+    }
+
+    /**
+     * If no {@code SNAPSHOT} arrives, replace the stuck “Joining…” line with a concrete hint.
+     */
+    private void scheduleLobbyJoinWatchdog() {
+        cancelLobbyJoinWatchdog();
+        lobbyJoinWatchdog = new PauseTransition(Duration.seconds(12));
+        lobbyJoinWatchdog.setOnFinished(e -> {
+            lobbyJoinWatchdog = null;
+            if (primaryStage == null || lobbyScene == null || lobbyStatusLabel == null) {
+                return;
+            }
+            if (primaryStage.getScene() != lobbyScene) {
+                return;
+            }
+            String t = lobbyStatusLabel.getText();
+            if (t == null || !t.startsWith("Joining room")) {
+                return;
+            }
+            lobbyStatusLabel.setText(
+                    "Join timed out. Run WhiteboardServer on " + networkHost + ":" + networkPort
+                    + " (same project), then try Create Room again.");
+            lobbyStatusLabel.getStyleClass().clear();
+            lobbyStatusLabel.getStyleClass().add("lobby-status-disconnected");
+        });
+        lobbyJoinWatchdog.play();
+    }
+
     private void refreshLobbyRooms(List<RoomInfo> rooms) {
         if (lobbyRoomList == null) {
             return;
@@ -596,11 +668,7 @@ public class WhiteboardApp extends Application {
             Button joinBtn = new Button("Join");
             joinBtn.getStyleClass().add("tool-button");
             String rid = info.roomId();
-            joinBtn.setOnAction(e -> {
-                if (networkClient != null && networkClient.isRunning()) {
-                    networkClient.sendJoinRoom(rid);
-                }
-            });
+            joinBtn.setOnAction(e -> joinRoomFromLobby(rid));
 
             card.getChildren().addAll(textCol, joinBtn);
             lobbyRoomList.getChildren().add(card);
@@ -630,6 +698,7 @@ public class WhiteboardApp extends Application {
     }
 
     private void leaveCanvasRoom() {
+        cancelLobbyJoinWatchdog();
         if (networkClient != null) {
             networkClient.sendLeaveRoom();
         }
@@ -1173,6 +1242,8 @@ public class WhiteboardApp extends Application {
         List<String> raw    = params.getRaw();
         String host = raw.size() > 0 ? raw.get(0) : DEFAULT_HOST;
         int    port = raw.size() > 1 ? parseInt(raw.get(1), DEFAULT_PORT) : DEFAULT_PORT;
+        networkHost = host;
+        networkPort = port;
 
         networkClient = new NetworkClient(host, port, authorName, clientId);
         networkClient.addLobbyListener(rooms ->
@@ -1184,16 +1255,29 @@ public class WhiteboardApp extends Application {
             @Override
             public void onSnapshotReceived(List<Shape> incoming) {
                 Platform.runLater(() -> {
+                    cancelLobbyJoinWatchdog();
+                    List<Shape> list = incoming != null ? incoming : List.of();
                     shapes.clear();
-                    incoming.forEach(s -> shapes.put(s.objectId(), s));
-                    redrawBaseCanvas(shapes.values());
-                    if (primaryStage != null && lobbyScene != null
-                            && primaryStage.getScene() == lobbyScene) {
-                        roomId = networkClient != null ? networkClient.getActiveRoomId() : "";
+                    for (Shape s : list) {
+                        if (s != null) {
+                            shapes.put(s.objectId(), s);
+                        }
+                    }
+                    roomId = networkClient != null ? networkClient.getActiveRoomId() : "";
+                    Scene cur = primaryStage != null ? primaryStage.getScene() : null;
+                    // Switch scenes before redraw: while the lobby is showing, the canvas may
+                    // still be size 0 / not laid out; drawing first could throw and block the switch.
+                    if (primaryStage != null && canvasScene != null && cur != null
+                            && cur != canvasScene && (loginScene == null || cur != loginScene)) {
                         primaryStage.setScene(canvasScene);
                         primaryStage.setTitle("DistriSync – " + authorName + "  [" + roomId + "]");
                         controlPane.toFront();
                         setStatus("⬤ Connected", GREEN);
+                    }
+                    try {
+                        redrawBaseCanvas(shapes.values());
+                    } catch (RuntimeException ex) {
+                        log.error("redrawBaseCanvas after SNAPSHOT failed", ex);
                     }
                     log.info("Snapshot applied — {} shape(s) on canvas", shapes.size());
                 });
