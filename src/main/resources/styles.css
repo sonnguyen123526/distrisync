@@ -3,10 +3,77 @@
    Loaded via scene.getStylesheets() in WhiteboardApp.java
    ═══════════════════════════════════════════════════════════════ */
 
+/* ── Login scene ─────────────────────────────────────────────── */
+.login-root {
+    -fx-background-color: #0f172a;
+    -fx-alignment: center;
+}
+
+.card {
+    -fx-background-color: #1e293b;
+    -fx-background-radius: 12;
+    -fx-padding: 40;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.45), 24, 0.15, 0, 8);
+}
+
+.text-input-modern {
+    -fx-background-color: #0f172a;
+    -fx-text-fill: #ffffff;
+    -fx-prompt-text-fill: #64748b;
+    -fx-border-color: #334155;
+    -fx-border-width: 1;
+    -fx-border-radius: 6;
+    -fx-background-radius: 6;
+    -fx-padding: 10 15 10 15;
+}
+
+.primary-button-large {
+    -fx-background-color: #3b82f6;
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+    -fx-background-radius: 6;
+    -fx-padding: 12 20 12 20;
+    -fx-cursor: hand;
+    -fx-max-width: infinity;
+}
+
+.primary-button-large:hover {
+    -fx-background-color: #2563eb;
+}
+
 /* ── Sidebar container ──────────────────────────────────────── */
 .sidebar {
     -fx-background-color: #0f172a;
-    -fx-padding: 20;
+    -fx-padding: 16;
+    -fx-min-height: 0;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.22), 16, 0, 6, 0);
+}
+
+/* Scrollable tool area — keeps bottom actions on-screen */
+.sidebar-scroll {
+    -fx-background-color: transparent;
+    -fx-background: transparent;
+    -fx-padding: 0;
+    -fx-min-height: 0;
+    -fx-min-width: 0;
+}
+
+.sidebar-scroll > .viewport {
+    -fx-background-color: #0f172a;
+}
+
+.sidebar-scroll > .scroll-bar:vertical {
+    -fx-background-color: transparent;
+    -fx-pref-width: 10;
+}
+
+.sidebar-scroll > .scroll-bar:vertical .thumb {
+    -fx-background-color: rgba(148, 163, 184, 0.45);
+    -fx-background-radius: 5;
+}
+
+.sidebar-scroll > .scroll-bar:vertical .thumb:hover {
+    -fx-background-color: rgba(148, 163, 184, 0.65);
 }
 
 /* ── Section header labels ──────────────────────────────────── */
@@ -22,8 +89,9 @@
 .tool-button {
     -fx-background-color: #1e293b;
     -fx-text-fill: #f8fafc;
-    -fx-background-radius: 6;
-    -fx-padding: 8 12 8 12;
+    -fx-background-radius: 8;
+    -fx-padding: 10 14 10 14;
+    -fx-min-height: 40;
     -fx-cursor: hand;
     -fx-alignment: CENTER_LEFT;
     -fx-border-width: 0;
@@ -34,25 +102,86 @@
     -fx-background-color: #334155;
 }
 
+.tool-button:armed {
+    -fx-background-color: #475569;
+}
+
 .tool-button:selected {
     -fx-background-color: #3b82f6;
     -fx-text-fill: #ffffff;
     -fx-font-weight: bold;
 }
 
+.tool-button:selected:armed {
+    -fx-background-color: #2563eb;
+}
+
+/* ── Sidebar secondary action (e.g. Undo) — distinct from tools ─ */
+.sidebar-secondary-button {
+    -fx-background-color: transparent;
+    -fx-border-color: #475569;
+    -fx-border-width: 1;
+    -fx-border-radius: 8;
+    -fx-background-radius: 8;
+    -fx-text-fill: #e2e8f0;
+    -fx-padding: 10 14 10 14;
+    -fx-min-height: 40;
+    -fx-cursor: hand;
+    -fx-font-size: 13px;
+}
+
+.sidebar-secondary-button:hover {
+    -fx-background-color: rgba(51, 65, 85, 0.55);
+    -fx-border-color: #64748b;
+}
+
+.sidebar-secondary-button:armed {
+    -fx-background-color: #334155;
+}
+
 /* ── Danger (destructive action) button ─────────────────────── */
 .danger-button {
     -fx-background-color: #e11d48;
     -fx-text-fill: #ffffff;
-    -fx-background-radius: 6;
-    -fx-padding: 8 12 8 12;
+    -fx-background-radius: 8;
+    -fx-padding: 10 14 10 14;
+    -fx-min-height: 40;
     -fx-cursor: hand;
     -fx-font-size: 13px;
+    -fx-font-weight: bold;
     -fx-border-width: 0;
 }
 
 .danger-button:hover {
     -fx-background-color: #be123c;
+}
+
+.danger-button:armed {
+    -fx-background-color: #9f1239;
+}
+
+/* ── Ghost danger (outline leave / secondary destructive) ───── */
+.ghost-danger-button {
+    -fx-background-color: transparent;
+    -fx-border-color: #e11d48;
+    -fx-border-width: 1;
+    -fx-border-radius: 8;
+    -fx-background-radius: 8;
+    -fx-text-fill: #e11d48;
+    -fx-padding: 10 14 10 14;
+    -fx-min-height: 40;
+    -fx-cursor: hand;
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+}
+
+.ghost-danger-button:hover {
+    -fx-background-color: #ffe4e6;
+}
+
+.ghost-danger-button:armed {
+    -fx-background-color: #fecdd3;
+    -fx-border-color: #be123c;
 }
 
 /* ── Connection status indicator ────────────────────────────── */
@@ -67,6 +196,29 @@
 
 .lobby-root {
     -fx-background-color: #0f172a;
+}
+
+.lobby-container {
+    -fx-max-width: 600;
+    -fx-spacing: 20;
+    -fx-alignment: top_center;
+    -fx-padding: 40;
+}
+
+.lobby-container > .lobby-header {
+    -fx-text-alignment: center;
+}
+
+.empty-state-text {
+    -fx-text-fill: #64748b;
+    -fx-font-size: 14px;
+    -fx-font-style: italic;
+}
+
+.room-card {
+    -fx-background-color: #1e293b;
+    -fx-padding: 15;
+    -fx-background-radius: 8;
 }
 
 .lobby-header {
@@ -87,13 +239,6 @@
 
 .lobby-scroll > .viewport {
     -fx-background-color: #0f172a;
-}
-
-.lobby-card {
-    -fx-background-color: #1e293b;
-    -fx-background-radius: 10;
-    -fx-padding: 14 18 14 18;
-    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 12, 0.2, 0, 2);
 }
 
 .lobby-room-title {

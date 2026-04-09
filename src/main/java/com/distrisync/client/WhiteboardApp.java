@@ -10,6 +10,7 @@ import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
+import javafx.geometry.Rectangle2D;
 import javafx.scene.Cursor;
 import javafx.scene.Scene;
 import javafx.scene.canvas.Canvas;
@@ -20,7 +21,6 @@ import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
 import javafx.scene.control.Slider;
 import javafx.scene.control.TextField;
-import javafx.scene.control.TextInputDialog;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.ToggleGroup;
 import javafx.scene.control.Tooltip;
@@ -41,6 +41,7 @@ import javafx.scene.shape.StrokeLineJoin;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontPosture;
 import javafx.scene.text.FontWeight;
+import javafx.stage.Screen;
 import javafx.stage.Stage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,7 +54,6 @@ import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -147,6 +147,7 @@ public class WhiteboardApp extends Application {
     private Scene   lobbyScene;
     private Scene   canvasScene;
     private VBox    lobbyRoomList;
+    private Label   lobbyEmptyStateLabel;
     private Label   lobbyStatusLabel;
     private TextField newRoomField;
 
@@ -186,21 +187,14 @@ public class WhiteboardApp extends Application {
 
     @Override
     public void start(Stage stage) {
-        // Prompt for the user's display name before anything else is shown.
-        // This runs synchronously on the FX thread so networking (which embeds
-        // the name in the HANDSHAKE) starts only after the dialog is dismissed.
-        TextInputDialog nameDialog = new TextInputDialog("Anonymous");
-        nameDialog.setTitle("DistriSync – Welcome");
-        nameDialog.setHeaderText("Collaborative Whiteboard");
-        nameDialog.setContentText("Your display name:");
-        nameDialog.getDialogPane().setStyle("-fx-background-color: #1e1e2e; -fx-font-size: 13px;");
-        Optional<String> nameResult = nameDialog.showAndWait();
-        String rawName = nameResult.orElse("Anonymous").strip();
-        authorName = rawName.isBlank() ? "Anonymous" : rawName;
-        clientId   = UUID.randomUUID().toString();
-
         primaryStage = stage;
-        stage.setTitle("DistriSync – Lobby");
+        Rectangle2D visual = Screen.getPrimary().getVisualBounds();
+        // Keep mins usable on small displays; never larger than the usable screen.
+        double maxMinW = Math.max(360, visual.getWidth() - 32);
+        double maxMinH = Math.max(340, visual.getHeight() - 72);
+        stage.setMinWidth(Math.min(520, maxMinW));
+        stage.setMinHeight(Math.min(460, maxMinH));
+        stage.setTitle("DistriSync – Welcome");
 
         // ── Layer 1: base canvas ──────────────────────────────────────────────
         baseCanvas = new Canvas();
@@ -256,7 +250,11 @@ public class WhiteboardApp extends Application {
             "-fx-background-color: #313244; -fx-text-fill: #cdd6f4;" +
             "-fx-font-size: 12px; -fx-padding: 5 9; -fx-background-radius: 6;");
 
-        canvasScene = new Scene(root, 1280, 860);
+        double canvasW = Math.clamp(visual.getWidth() * 0.92, 640, 1400);
+        double canvasH = Math.clamp(visual.getHeight() * 0.90, 420, 920);
+        canvasW = Math.min(canvasW, visual.getWidth() - 8);
+        canvasH = Math.min(canvasH, visual.getHeight() - 32);
+        canvasScene = new Scene(root, canvasW, canvasH);
         canvasScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
 
         // ── Ctrl+Z keyboard shortcut for undo (canvas scene only) ─────────────
@@ -267,10 +265,59 @@ public class WhiteboardApp extends Application {
         });
 
         Parent lobbyRoot = buildLobbyRoot();
-        lobbyScene = new Scene(lobbyRoot, 960, 640);
+        double shellW = Math.clamp(visual.getWidth() * 0.88, 480, 960);
+        double shellH = Math.clamp(visual.getHeight() * 0.86, 380, 720);
+        shellW = Math.min(shellW, visual.getWidth() - 8);
+        shellH = Math.min(shellH, visual.getHeight() - 32);
+        lobbyScene = new Scene(lobbyRoot, shellW, shellH);
         lobbyScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
 
-        stage.setScene(lobbyScene);
+        StackPane loginRoot = new StackPane();
+        loginRoot.getStyleClass().add("login-root");
+
+        Label loginTitle = new Label("Welcome to DistriSync");
+        loginTitle.getStyleClass().add("lobby-header");
+        loginTitle.setMaxWidth(Double.MAX_VALUE);
+
+        Label loginSubtitle = new Label("Enter your display name to continue");
+        loginSubtitle.getStyleClass().add("lobby-subtitle");
+        loginSubtitle.setWrapText(true);
+        loginSubtitle.setMaxWidth(Double.MAX_VALUE);
+
+        TextField nameField = new TextField();
+        nameField.setPromptText("Display name");
+        nameField.getStyleClass().add("text-input-modern");
+        nameField.setMaxWidth(Double.MAX_VALUE);
+
+        Button joinNetworkBtn = new Button("Join Network");
+        joinNetworkBtn.getStyleClass().add("primary-button-large");
+        joinNetworkBtn.setMaxWidth(Double.MAX_VALUE);
+
+        VBox loginCard = new VBox(16, loginTitle, loginSubtitle, nameField, joinNetworkBtn);
+        loginCard.setAlignment(Pos.TOP_LEFT);
+        loginCard.getStyleClass().add("card");
+        loginCard.setMaxWidth(440);
+
+        loginRoot.getChildren().add(loginCard);
+
+        Scene loginScene = new Scene(loginRoot, shellW, shellH);
+        loginScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+
+        Runnable attemptJoin = () -> {
+            String raw = nameField.getText() != null ? nameField.getText().strip() : "";
+            if (raw.isEmpty()) {
+                return;
+            }
+            authorName = raw;
+            clientId = UUID.randomUUID().toString();
+            initNetworking();
+            stage.setScene(lobbyScene);
+            stage.setTitle("DistriSync – Lobby");
+        };
+        joinNetworkBtn.setOnAction(e -> attemptJoin.run());
+        nameField.setOnAction(e -> attemptJoin.run());
+
+        stage.setScene(loginScene);
         stage.show();
 
         // controlPane must sit above cursorPane; toFront() reaffirms StackPane z-order.
@@ -282,7 +329,6 @@ public class WhiteboardApp extends Application {
         // Wire all mouse events to the StackPane (always hit-testable)
         wireMouseEvents(canvasStack);
 
-        initNetworking();
         startRenderLoop();
     }
 
@@ -299,14 +345,18 @@ public class WhiteboardApp extends Application {
     // Toolbar construction
     // =========================================================================
 
-    private VBox buildToolbar() {
-        // Master sidebar — spacing of 25 lets the sections breathe
-        VBox box = new VBox(25);
-        box.setPrefWidth(TOOLBAR_WIDTH);
-        box.setMinWidth(TOOLBAR_WIDTH);
-        box.setMaxWidth(TOOLBAR_WIDTH);
-        box.setPadding(new Insets(20));
-        box.getStyleClass().add("sidebar");
+    private BorderPane buildToolbar() {
+        // BorderPane keeps the bottom actions pinned; center ScrollPane only grows between
+        // title and footer (VBox + vgrow made the scroll area claim content height and
+        // pushed Clear / Leave / status off-screen on short windows).
+        BorderPane sidebar = new BorderPane();
+        sidebar.setPrefWidth(TOOLBAR_WIDTH);
+        sidebar.setMinWidth(TOOLBAR_WIDTH);
+        sidebar.setMaxWidth(TOOLBAR_WIDTH);
+        sidebar.setMinHeight(0);
+        sidebar.setMaxHeight(Double.MAX_VALUE);
+        sidebar.setPadding(new Insets(16));
+        sidebar.getStyleClass().add("sidebar");
 
         // App title
         Label title = new Label("DistriSync");
@@ -374,46 +424,63 @@ public class WhiteboardApp extends Application {
             sectionLabel("STROKE WIDTH"),
             strokeSlider
         );
+        colorSection.setPadding(new Insets(0, 0, 10, 0));
+        strokeSection.setPadding(new Insets(0, 0, 10, 0));
 
-        // ── Action buttons ────────────────────────────────────────────────────
+        VBox topTools = new VBox(25, toolsSection, colorSection, strokeSection);
+
+        // ── Action buttons — bottom group with spacer above ───────────────────
         Button undoBtn = new Button("⤺  Undo Last");
         undoBtn.setMaxWidth(Double.MAX_VALUE);
-        undoBtn.getStyleClass().add("tool-button");
+        undoBtn.getStyleClass().add("sidebar-secondary-button");
         undoBtn.setOnAction(e -> undoLastShape());
+        undoBtn.setTooltip(new Tooltip("Undo last stroke (Ctrl+Z)"));
 
         Button clearBtn = new Button("Clear Board");
         clearBtn.setMaxWidth(Double.MAX_VALUE);
         clearBtn.getStyleClass().add("danger-button");
         clearBtn.setOnAction(e -> clearBoard());
+        clearBtn.setTooltip(new Tooltip("Remove all shapes on this board for everyone"));
 
         Button leaveRoomBtn = new Button("Leave Room");
         leaveRoomBtn.setMaxWidth(Double.MAX_VALUE);
-        leaveRoomBtn.getStyleClass().add("danger-button");
+        leaveRoomBtn.getStyleClass().add("ghost-danger-button");
         leaveRoomBtn.setOnAction(e -> leaveCanvasRoom());
+        leaveRoomBtn.setTooltip(new Tooltip("Return to the lobby"));
 
-        VBox actionsSection = new VBox(10, undoBtn, clearBtn, leaveRoomBtn);
+        VBox actionButtons = new VBox(10, undoBtn, clearBtn, leaveRoomBtn);
 
-        // ── Status label — Region spacer pushes it to the absolute bottom ─────
         statusLabel = new Label("⬤ Offline");
         statusLabel.setStyle("-fx-text-fill: " + RED + "; -fx-font-size: 12px;");
         statusLabel.setMaxWidth(Double.MAX_VALUE);
         statusLabel.setAlignment(Pos.CENTER);
-        VBox.setMargin(statusLabel, new Insets(0, 0, 4, 0));
+        VBox.setMargin(statusLabel, new Insets(10, 0, 0, 0));
 
-        Region spacer = new Region();
-        VBox.setVgrow(spacer, Priority.ALWAYS);
+        VBox bottomGroup = new VBox(actionButtons, statusLabel);
 
-        box.getChildren().addAll(
-            title,
-            toolsSection,
-            colorSection,
-            strokeSection,
-            actionsSection,
-            spacer,
-            statusLabel
-        );
+        topTools.setMinSize(0, 0);
+        VBox scrollBody = new VBox(25, topTools);
+        scrollBody.setMaxWidth(Double.MAX_VALUE);
+        scrollBody.setMinSize(0, 0);
 
-        return box;
+        ScrollPane toolsScroll = new ScrollPane(scrollBody);
+        toolsScroll.setFitToWidth(true);
+        toolsScroll.setMinSize(0, 0);
+        toolsScroll.setMinViewportHeight(0);
+        toolsScroll.setPrefViewportHeight(120);
+        toolsScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        toolsScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
+        toolsScroll.setPannable(false);
+        toolsScroll.getStyleClass().add("sidebar-scroll");
+
+        sidebar.setTop(title);
+        BorderPane.setAlignment(title, Pos.TOP_CENTER);
+        BorderPane.setMargin(title, new Insets(0, 0, 12, 0));
+        sidebar.setCenter(toolsScroll);
+        sidebar.setBottom(bottomGroup);
+        BorderPane.setMargin(bottomGroup, new Insets(8, 0, 0, 0));
+
+        return sidebar;
     }
 
     private ToggleButton toolToggle(String text, ToggleGroup group, boolean selected) {
@@ -436,29 +503,19 @@ public class WhiteboardApp extends Application {
     // =========================================================================
 
     private Parent buildLobbyRoot() {
-        VBox root = new VBox(16);
-        root.setPadding(new Insets(28));
-        root.setMaxWidth(Double.MAX_VALUE);
-        root.setMaxHeight(Double.MAX_VALUE);
+        StackPane root = new StackPane();
         root.getStyleClass().add("lobby-root");
+
+        VBox container = new VBox();
+        container.setFillWidth(true);
+        container.setMaxWidth(600);
+        container.setMaxHeight(Double.MAX_VALUE);
+        container.getStyleClass().add("lobby-container");
+        StackPane.setAlignment(container, Pos.TOP_CENTER);
 
         Label header = new Label("DistriSync Lobby");
         header.getStyleClass().add("lobby-header");
         header.setMaxWidth(Double.MAX_VALUE);
-
-        Label subtitle = new Label("Join an active room or create a new one.");
-        subtitle.getStyleClass().add("lobby-subtitle");
-        subtitle.setWrapText(true);
-        subtitle.setMaxWidth(Double.MAX_VALUE);
-
-        lobbyRoomList = new VBox(10);
-        lobbyRoomList.setFillWidth(true);
-
-        ScrollPane scroll = new ScrollPane(lobbyRoomList);
-        scroll.setFitToWidth(true);
-        scroll.setMinHeight(220);
-        scroll.getStyleClass().add("lobby-scroll");
-        VBox.setVgrow(scroll, Priority.ALWAYS);
 
         newRoomField = new TextField();
         newRoomField.setPromptText("New room name…");
@@ -478,12 +535,34 @@ public class WhiteboardApp extends Application {
         createRow.setAlignment(Pos.CENTER_LEFT);
         HBox.setHgrow(newRoomField, Priority.ALWAYS);
 
+        lobbyRoomList = new VBox(10);
+        lobbyRoomList.setFillWidth(true);
+
+        lobbyEmptyStateLabel = new Label("No active rooms. Create one to get started.");
+        lobbyEmptyStateLabel.getStyleClass().add("empty-state-text");
+        lobbyEmptyStateLabel.setWrapText(true);
+        lobbyEmptyStateLabel.setMaxWidth(Double.MAX_VALUE);
+        lobbyEmptyStateLabel.setVisible(true);
+        lobbyEmptyStateLabel.setManaged(true);
+
+        VBox roomsSection = new VBox(10);
+        roomsSection.setFillWidth(true);
+        roomsSection.getChildren().addAll(lobbyEmptyStateLabel, lobbyRoomList);
+        VBox.setVgrow(lobbyRoomList, Priority.ALWAYS);
+
+        ScrollPane scroll = new ScrollPane(roomsSection);
+        scroll.setFitToWidth(true);
+        scroll.setMinHeight(220);
+        scroll.getStyleClass().add("lobby-scroll");
+        VBox.setVgrow(scroll, Priority.ALWAYS);
+
         lobbyStatusLabel = new Label("Connecting…");
         lobbyStatusLabel.setWrapText(true);
         lobbyStatusLabel.setMaxWidth(Double.MAX_VALUE);
         lobbyStatusLabel.getStyleClass().add("lobby-status-muted");
 
-        root.getChildren().addAll(header, subtitle, scroll, createRow, lobbyStatusLabel);
+        container.getChildren().addAll(header, createRow, scroll, lobbyStatusLabel);
+        root.getChildren().add(container);
         return root;
     }
 
@@ -492,10 +571,18 @@ public class WhiteboardApp extends Application {
             return;
         }
         lobbyRoomList.getChildren().clear();
+        boolean empty = rooms == null || rooms.isEmpty();
+        if (lobbyEmptyStateLabel != null) {
+            lobbyEmptyStateLabel.setVisible(empty);
+            lobbyEmptyStateLabel.setManaged(empty);
+        }
+        if (rooms == null) {
+            return;
+        }
         for (RoomInfo info : rooms) {
             HBox card = new HBox(16);
             card.setAlignment(Pos.CENTER_LEFT);
-            card.getStyleClass().add("lobby-card");
+            card.getStyleClass().add("room-card");
 
             VBox textCol = new VBox(4);
             Label idLab = new Label(info.roomId());
