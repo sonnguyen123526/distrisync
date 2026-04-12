@@ -60,6 +60,8 @@ import static org.assertj.core.api.Assertions.*;
  */
 class WalManagerTest {
 
+    private static final String BOARD = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+
     /**
      * Fresh temporary directory injected by JUnit 5 before each test and
      * deleted automatically after.  Because this is an instance field (not
@@ -112,15 +114,15 @@ class WalManagerTest {
 
         // ── When: append all three, then close and reopen the WalManager ──────
         try (WalManager writer = new WalManager(tempDir)) {
-            writer.append("TestRoom", msg1);
-            writer.append("TestRoom", msg2);
-            writer.append("TestRoom", msg3);
+            writer.append("TestRoom", BOARD, msg1);
+            writer.append("TestRoom", BOARD, msg2);
+            writer.append("TestRoom", BOARD, msg3);
         }
 
         // A brand-new WalManager instance opens the same directory for recovery.
         List<Message> recovered;
         try (WalManager reader = new WalManager(tempDir)) {
-            recovered = reader.recover("TestRoom");
+            recovered = reader.recover("TestRoom", BOARD);
         }
 
         // ── Then: 1. Cardinality ──────────────────────────────────────────────
@@ -177,7 +179,7 @@ class WalManagerTest {
     @Test
     void testNoWalFile_RecoverReturnsEmptyList() throws IOException {
         try (WalManager wal = new WalManager(tempDir)) {
-            List<Message> result = wal.recover("NeverWrittenRoom");
+            List<Message> result = wal.recover("NeverWrittenRoom", BOARD);
 
             assertThat(result)
                     .as("recover() for a room with no WAL file must return an empty list, not null")
@@ -201,10 +203,10 @@ class WalManagerTest {
     @Test
     void testEmptyWalFile_RecoverReturnsEmptyList() throws IOException {
         // Pre-create an empty WAL file, simulating a crash before the first write.
-        Files.createFile(tempDir.resolve("EmptyRoom.wal"));
+        Files.createFile(tempDir.resolve("EmptyRoom_Board-1.wal"));
 
         try (WalManager wal = new WalManager(tempDir)) {
-            List<Message> result = wal.recover("EmptyRoom");
+            List<Message> result = wal.recover("EmptyRoom", BOARD);
 
             assertThat(result)
                     .as("recover() on a zero-byte WAL file must return an empty list, not throw")
@@ -226,7 +228,7 @@ class WalManagerTest {
      */
     @Test
     void testWalFileCreatedOnFirstAppend() throws IOException {
-        Path expectedFile = tempDir.resolve("FileCreationRoom.wal");
+        Path expectedFile = tempDir.resolve("FileCreationRoom_Board-1.wal");
 
         try (WalManager wal = new WalManager(tempDir)) {
             assertThat(expectedFile)
@@ -234,7 +236,7 @@ class WalManagerTest {
                         "WalManager must use lazy file creation")
                     .doesNotExist();
 
-            wal.append("FileCreationRoom", shapeCommit(1));
+            wal.append("FileCreationRoom", BOARD, shapeCommit(1));
 
             assertThat(expectedFile)
                     .as("WAL file must exist on disk after the first append call")
@@ -269,23 +271,23 @@ class WalManagerTest {
         Message betaMsg2 = new Message(MessageType.SHAPE_COMMIT, "{\"room\":\"Beta\",\"seq\":2}");
 
         try (WalManager wal = new WalManager(tempDir)) {
-            wal.append("Alpha", alphaMsg);
-            wal.append("Beta",  betaMsg1);
-            wal.append("Beta",  betaMsg2);
+            wal.append("Alpha", BOARD, alphaMsg);
+            wal.append("Beta", BOARD, betaMsg1);
+            wal.append("Beta", BOARD, betaMsg2);
         }
 
         // ── Physical file isolation ───────────────────────────────────────────
-        assertThat(tempDir.resolve("Alpha.wal"))
+        assertThat(tempDir.resolve("Alpha_Board-1.wal"))
                 .as("a dedicated WAL file must exist for room 'Alpha'")
                 .exists();
-        assertThat(tempDir.resolve("Beta.wal"))
+        assertThat(tempDir.resolve("Beta_Board-1.wal"))
                 .as("a dedicated WAL file must exist for room 'Beta'")
                 .exists();
 
         // ── Content isolation ─────────────────────────────────────────────────
         try (WalManager reader = new WalManager(tempDir)) {
-            List<Message> alphaRecords = reader.recover("Alpha");
-            List<Message> betaRecords  = reader.recover("Beta");
+            List<Message> alphaRecords = reader.recover("Alpha", BOARD);
+            List<Message> betaRecords  = reader.recover("Beta", BOARD);
 
             assertThat(alphaRecords)
                     .as("room 'Alpha' must recover exactly 1 record")
@@ -338,15 +340,15 @@ class WalManagerTest {
 
         // ── Write two valid frames and close ──────────────────────────────────
         try (WalManager wal = new WalManager(tempDir)) {
-            wal.append("CrashRoom", first);
-            wal.append("CrashRoom", second);
+            wal.append("CrashRoom", BOARD, first);
+            wal.append("CrashRoom", BOARD, second);
         }
 
         // ── Inject a truncated frame: header only (5 bytes), no payload ───────
         // type byte = 0x07 (SHAPE_COMMIT), length = 1000 (0x00 0x00 0x03 0xE8)
         // The declared payload of 1 000 bytes is absent → PartialMessageException
         // on decode.
-        Path walFile = tempDir.resolve("CrashRoom.wal");
+        Path walFile = tempDir.resolve("CrashRoom_Board-1.wal");
         byte[] corruptTail = {
             (byte) 0x07,                      // type: SHAPE_COMMIT
             (byte) 0x00, (byte) 0x00,
@@ -357,12 +359,12 @@ class WalManagerTest {
         // ── Recover and verify only the clean prefix survives ─────────────────
         List<Message> recovered;
         try (WalManager reader = new WalManager(tempDir)) {
-            assertThatCode(() -> reader.recover("CrashRoom"))
+            assertThatCode(() -> reader.recover("CrashRoom", BOARD))
                     .as("recover() must not throw when encountering a truncated tail frame — " +
                         "crash-tolerance is a core WAL contract")
                     .doesNotThrowAnyException();
 
-            recovered = reader.recover("CrashRoom");
+            recovered = reader.recover("CrashRoom", BOARD);
         }
 
         assertThat(recovered)
@@ -405,19 +407,19 @@ class WalManagerTest {
 
         // ── First WalManager lifetime ─────────────────────────────────────────
         try (WalManager wal1 = new WalManager(tempDir)) {
-            wal1.append("AccumRoom", batch1a);
-            wal1.append("AccumRoom", batch1b);
+            wal1.append("AccumRoom", BOARD, batch1a);
+            wal1.append("AccumRoom", BOARD, batch1b);
         }
 
         // ── Second WalManager lifetime — must NOT truncate existing file ───────
         try (WalManager wal2 = new WalManager(tempDir)) {
-            wal2.append("AccumRoom", batch2a);
-            wal2.append("AccumRoom", batch2b);
+            wal2.append("AccumRoom", BOARD, batch2a);
+            wal2.append("AccumRoom", BOARD, batch2b);
         }
 
         // ── Recovery must see all four records ────────────────────────────────
         try (WalManager reader = new WalManager(tempDir)) {
-            List<Message> recovered = reader.recover("AccumRoom");
+            List<Message> recovered = reader.recover("AccumRoom", BOARD);
 
             assertThat(recovered)
                     .as("reopening WalManager must APPEND to the existing WAL, not truncate it — " +
@@ -456,22 +458,22 @@ class WalManagerTest {
         Message msg = shapeCommit(99);
 
         try (WalManager wal = new WalManager(tempDir)) {
-            assertThatCode(() -> wal.append(unsafeRoomId, msg))
+            assertThatCode(() -> wal.append(unsafeRoomId, BOARD, msg))
                     .as("append() must succeed even when the roomId contains filesystem-unsafe characters")
                     .doesNotThrowAnyException();
         }
 
         // ── Physical file must use the sanitised name ─────────────────────────
-        Path expectedFile = tempDir.resolve("Room_Sub_Name_.wal");
+        Path expectedFile = tempDir.resolve("Room_Sub_Name__Board-1.wal");
         assertThat(expectedFile)
                 .as("unsafe characters must be replaced with underscores in the WAL filename — " +
-                    "expected file: Room_Sub_Name_.wal")
+                    "expected file: Room_Sub_Name__Board-1.wal")
                 .exists()
                 .isRegularFile();
 
         // ── Recovery via the original room ID must still work ─────────────────
         try (WalManager reader = new WalManager(tempDir)) {
-            List<Message> recovered = reader.recover(unsafeRoomId);
+            List<Message> recovered = reader.recover(unsafeRoomId, BOARD);
 
             assertThat(recovered)
                     .as("recover() called with the original unsanitised roomId must find the " +
@@ -497,15 +499,23 @@ class WalManagerTest {
         try (WalManager wal = new WalManager(tempDir)) {
             assertThatIllegalArgumentException()
                     .as("append(null, msg) must throw IllegalArgumentException")
-                    .isThrownBy(() -> wal.append(null, shapeCommit(1)));
+                    .isThrownBy(() -> wal.append(null, BOARD, shapeCommit(1)));
 
             assertThatIllegalArgumentException()
                     .as("append(\"\", msg) must throw IllegalArgumentException")
-                    .isThrownBy(() -> wal.append("", shapeCommit(1)));
+                    .isThrownBy(() -> wal.append("", BOARD, shapeCommit(1)));
 
             assertThatIllegalArgumentException()
                     .as("append(\"   \", msg) must throw IllegalArgumentException — whitespace-only is blank")
-                    .isThrownBy(() -> wal.append("   ", shapeCommit(1)));
+                    .isThrownBy(() -> wal.append("   ", BOARD, shapeCommit(1)));
+
+            assertThatIllegalArgumentException()
+                    .as("append with null boardId must throw IllegalArgumentException")
+                    .isThrownBy(() -> wal.append("SomeRoom", null, shapeCommit(1)));
+
+            assertThatIllegalArgumentException()
+                    .as("append with blank boardId must throw IllegalArgumentException")
+                    .isThrownBy(() -> wal.append("SomeRoom", "", shapeCommit(1)));
         }
     }
 
@@ -522,7 +532,7 @@ class WalManagerTest {
         try (WalManager wal = new WalManager(tempDir)) {
             assertThatIllegalArgumentException()
                     .as("append(roomId, null) must throw IllegalArgumentException")
-                    .isThrownBy(() -> wal.append("SomeRoom", null));
+                    .isThrownBy(() -> wal.append("SomeRoom", BOARD, null));
         }
     }
 
@@ -540,11 +550,19 @@ class WalManagerTest {
         try (WalManager wal = new WalManager(tempDir)) {
             assertThatIllegalArgumentException()
                     .as("recover(null) must throw IllegalArgumentException")
-                    .isThrownBy(() -> wal.recover(null));
+                    .isThrownBy(() -> wal.recover(null, BOARD));
 
             assertThatIllegalArgumentException()
                     .as("recover(\"\") must throw IllegalArgumentException")
-                    .isThrownBy(() -> wal.recover(""));
+                    .isThrownBy(() -> wal.recover("", BOARD));
+
+            assertThatIllegalArgumentException()
+                    .as("recover with null boardId must throw IllegalArgumentException")
+                    .isThrownBy(() -> wal.recover("SomeRoom", null));
+
+            assertThatIllegalArgumentException()
+                    .as("recover with blank boardId must throw IllegalArgumentException")
+                    .isThrownBy(() -> wal.recover("SomeRoom", ""));
         }
     }
 
@@ -564,7 +582,7 @@ class WalManagerTest {
     @Test
     void testClose_CalledTwice_DoesNotThrow() throws IOException {
         WalManager wal = new WalManager(tempDir);
-        wal.append("CloseRoom", shapeCommit(1));
+        wal.append("CloseRoom", BOARD, shapeCommit(1));
 
         assertThatCode(() -> {
             wal.close();
@@ -674,10 +692,10 @@ class WalManagerTest {
             // Each frame is ~33 bytes (5-byte header + 28-byte payload), so
             // the bloated file will be approximately 3 300 bytes.
             for (int i = 1; i <= 100; i++) {
-                wal.append(ROOM, shapeCommit(i));
+                wal.append(ROOM, BOARD, shapeCommit(i));
             }
 
-            long bloatedSize = wal.walFileSize(ROOM);
+            long bloatedSize = wal.walFileSize(ROOM, BOARD);
 
             // ── 1. Pre-compaction size guard ──────────────────────────────────
             assertThat(bloatedSize)
@@ -695,9 +713,9 @@ class WalManagerTest {
                     .hasSize(1);
 
             // Compact: replace the 100-frame WAL with a single MUTATION frame.
-            wal.compactWal(ROOM, snapshot);
+            wal.compactWal(ROOM, BOARD, snapshot);
 
-            long compactedSize = wal.walFileSize(ROOM);
+            long compactedSize = wal.walFileSize(ROOM, BOARD);
 
             // ── 2. Size-reduction ratio: at least 5× ─────────────────────────
             assertThat(compactedSize)
@@ -712,14 +730,14 @@ class WalManagerTest {
                     .isLessThan(1_024L);
 
             // ── 4. Temp file must have been cleaned up ────────────────────────
-            Path tmpFile = tempDir.resolve("CompactionRoom.wal.tmp");
+            Path tmpFile = tempDir.resolve("CompactionRoom_Board-1.wal.tmp");
             assertThat(tmpFile)
                     .as(".wal.tmp must not exist after successful compaction — " +
                         "Files.move(ATOMIC_MOVE) must have renamed it to .wal")
                     .doesNotExist();
 
             // ── 5. Active .wal file must be a regular file ────────────────────
-            Path walFile = tempDir.resolve("CompactionRoom.wal");
+            Path walFile = tempDir.resolve("CompactionRoom_Board-1.wal");
             assertThat(walFile)
                     .as("compacted .wal file must exist as a regular file after compaction")
                     .exists()
@@ -728,20 +746,18 @@ class WalManagerTest {
 
         // ── Phase 3: Verify recovery — fresh WalManager + fresh RoomContext ───
         //
-        // RoomContext's constructor calls WalManager.recover() and replays every
-        // MUTATION frame into a new CanvasStateManager.  After compaction the WAL
-        // contains exactly one MUTATION frame representing the surviving shape.
+        // RoomContext lazy-opens boards via getBoard(); replay reads the compacted WAL.
         try (WalManager freshWal = new WalManager(tempDir)) {
             RoomContext recovered = new RoomContext(ROOM, freshWal);
 
             // ── 6. Shape count ─────────────────────────────────────────────────
-            assertThat(recovered.stateManager.size())
+            assertThat(recovered.getBoard(BOARD).size())
                     .as("recovered CanvasStateManager must contain exactly 1 shape — " +
                         "compaction must have written exactly one MUTATION frame (the surviving shape), " +
                         "not the 100 stale SHAPE_COMMIT frames it replaced")
                     .isEqualTo(1);
 
-            List<Shape> recoveredShapes = recovered.stateManager.snapshot();
+            List<Shape> recoveredShapes = recovered.getBoard(BOARD).snapshot();
 
             // ── 7. Shape identity ──────────────────────────────────────────────
             assertThat(recoveredShapes.get(0).objectId())

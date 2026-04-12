@@ -23,42 +23,29 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Append-only Write-Ahead Log engine for per-room canvas durability.
+ * Append-only Write-Ahead Log engine for per-room, per-board canvas durability.
  *
  * <h2>File layout</h2>
- * Each room produces a single file {@code <sanitisedRoomId>.wal} under the
- * configured {@code dataDir}.  The binary frame format is identical to the
- * wire protocol defined by {@link MessageCodec}:
- * <pre>
- * [type : 1 byte][payloadLength : 4 bytes BE][payload : UTF-8 JSON]
- * </pre>
+ * Each room/board pair produces {@code {sanitisedRoomId}_{sanitisedBoardId}.wal} under
+ * {@code dataDir}.  The binary frame format matches {@link MessageCodec}.
  *
  * <h2>Compaction</h2>
- * {@link #compactWal} rewrites the WAL to contain exactly one
- * {@code MUTATION} frame per surviving shape.  It writes to a
- * {@code .wal.tmp} side-file first and then atomically renames it over the
- * live {@code .wal}, so recovery is always consistent.
+ * {@link #compactWal} rewrites the WAL to minimal {@code MUTATION} frames via a
+ * {@code .wal.tmp} side-file and atomic rename.
  *
  * <h2>Thread safety</h2>
- * Safe for concurrent use by multiple threads.  Each room's
- * {@link FileChannel} is opened lazily and stored in a
- * {@link ConcurrentHashMap}.
+ * Concurrent use is safe; each composite WAL file has a lazily opened {@link FileChannel}
+ * in a {@link ConcurrentHashMap}.
  */
 final class WalManager implements Closeable {
 
     private static final Logger log = LoggerFactory.getLogger(WalManager.class);
 
     private final Path dataDir;
+    /** Key: {@code sanitize(roomId) + '_' + sanitize(boardId)} — matches {@code *.wal} basename (no suffix). */
     private final ConcurrentHashMap<String, FileChannel> channels = new ConcurrentHashMap<>();
     private volatile boolean closed = false;
 
-    /**
-     * Constructs a {@code WalManager} rooted at {@code dataDir}.
-     * The directory (and any missing parents) is created automatically.
-     *
-     * @param dataDir root directory for all WAL files; must not be {@code null}
-     * @throws IOException if the directory cannot be created
-     */
     WalManager(Path dataDir) throws IOException {
         if (dataDir == null) throw new IllegalArgumentException("dataDir must not be null");
         Files.createDirectories(dataDir);
@@ -66,56 +53,33 @@ final class WalManager implements Closeable {
         log.info("WalManager initialised  dataDir='{}'", dataDir);
     }
 
-    // =========================================================================
-    // Public API
-    // =========================================================================
-
     /**
-     * Appends {@code msg} to the WAL for {@code roomId}.
-     *
-     * <p>The WAL file is created lazily on the first append; subsequent calls
-     * open the existing file in {@link StandardOpenOption#APPEND} mode so
-     * existing records are never truncated.
-     *
-     * @param roomId the room whose WAL should receive the record; must not be
-     *               {@code null} or blank
-     * @param msg    the message to persist; must not be {@code null}
-     * @throws IllegalArgumentException if {@code roomId} is null/blank or
-     *                                  {@code msg} is null
-     * @throws IOException              on write failure
+     * Appends {@code msg} to the WAL for {@code roomId} and {@code boardId}.
      */
-    void append(String roomId, Message msg) throws IOException {
-        validateRoomId(roomId);
+    void append(String roomId, String boardId, Message msg) throws IOException {
+        validateNonBlank(roomId, "roomId");
+        validateNonBlank(boardId, "boardId");
         if (msg == null) throw new IllegalArgumentException("msg must not be null");
 
-        String safe = sanitize(roomId);
-        FileChannel ch = channels.computeIfAbsent(safe, k -> openChannel(k));
+        String key = walMapKey(roomId, boardId);
+        FileChannel ch = channels.computeIfAbsent(key, k -> openAppendChannel(k + ".wal"));
 
         ByteBuffer frame = MessageCodec.encode(msg);
         while (frame.hasRemaining()) {
             ch.write(frame);
         }
-        log.debug("WAL append  room='{}' type={} frameBytes={}", roomId, msg.type(), frame.capacity());
+        log.debug("WAL append  room='{}' board='{}' type={} frameBytes={}",
+                roomId, boardId, msg.type(), frame.capacity());
     }
 
     /**
-     * Reads all complete frames from the WAL for {@code roomId}.
-     *
-     * <p>A missing or empty WAL file returns an empty list rather than
-     * throwing.  A truncated tail frame (e.g. from a crash mid-write) is
-     * silently discarded; all earlier complete frames are returned.
-     *
-     * @param roomId the room whose WAL should be read; must not be {@code null}
-     *               or blank
-     * @return an ordered list of every complete {@link Message} frame found;
-     *         never {@code null}
-     * @throws IllegalArgumentException if {@code roomId} is null/blank
-     * @throws IOException              on read failure
+     * Reads all complete frames from the WAL for {@code roomId} and {@code boardId}.
      */
-    List<Message> recover(String roomId) throws IOException {
-        validateRoomId(roomId);
+    List<Message> recover(String roomId, String boardId) throws IOException {
+        validateNonBlank(roomId, "roomId");
+        validateNonBlank(boardId, "boardId");
 
-        Path path = walPath(roomId);
+        Path path = walPath(roomId, boardId);
         if (!Files.exists(path) || Files.size(path) == 0) {
             return new ArrayList<>();
         }
@@ -129,51 +93,29 @@ final class WalManager implements Closeable {
             try {
                 messages.add(MessageCodec.decode(buf));
             } catch (PartialMessageException e) {
-                log.warn("WAL truncated tail  room='{}' offset={} — discarding {} partial byte(s)",
-                        roomId, frameStart, buf.remaining());
+                log.warn("WAL truncated tail  room='{}' board='{}' offset={} — discarding {} partial byte(s)",
+                        roomId, boardId, frameStart, buf.remaining());
                 break;
             } catch (IllegalArgumentException e) {
-                log.warn("WAL corrupt frame  room='{}' offset={} cause='{}' — discarding tail",
-                        roomId, frameStart, e.getMessage());
+                log.warn("WAL corrupt frame  room='{}' board='{}' offset={} cause='{}' — discarding tail",
+                        roomId, boardId, frameStart, e.getMessage());
                 break;
             }
         }
 
-        log.debug("WAL recovered  room='{}' messages={}", roomId, messages.size());
+        log.debug("WAL recovered  room='{}' board='{}' messages={}", roomId, boardId, messages.size());
         return messages;
     }
 
-    /**
-     * Compacts the WAL for {@code roomId} to the minimum set of
-     * {@code MUTATION} frames needed to reconstruct {@code snapshot}.
-     *
-     * <p>The algorithm:
-     * <ol>
-     *   <li>Serialise every shape in {@code snapshot} as a single
-     *       {@code MUTATION} frame and write all frames to a side-file
-     *       {@code <room>.wal.tmp}.</li>
-     *   <li>Atomically rename {@code .wal.tmp} over the live {@code .wal}
-     *       so recovery is always consistent (no window where the WAL is
-     *       absent).</li>
-     *   <li>Close and evict the previously open {@link FileChannel} for this
-     *       room so the next {@link #append} re-opens the now-compacted file.
-     *   </li>
-     * </ol>
-     *
-     * @param roomId   target room; must not be {@code null} or blank
-     * @param snapshot current authoritative canvas state; each shape becomes
-     *                 one {@code MUTATION} frame
-     * @throws IOException on write or rename failure
-     */
-    void compactWal(String roomId, List<Shape> snapshot) throws IOException {
-        validateRoomId(roomId);
+    void compactWal(String roomId, String boardId, List<Shape> snapshot) throws IOException {
+        validateNonBlank(roomId, "roomId");
+        validateNonBlank(boardId, "boardId");
         if (snapshot == null) throw new IllegalArgumentException("snapshot must not be null");
 
-        String safe    = sanitize(roomId);
-        Path   walFile = dataDir.resolve(safe + ".wal");
-        Path   tmpFile = dataDir.resolve(safe + ".wal.tmp");
+        String baseName = walMapKey(roomId, boardId);
+        Path   walFile = dataDir.resolve(baseName + ".wal");
+        Path   tmpFile = dataDir.resolve(baseName + ".wal.tmp");
 
-        // Write compacted frames to side-file.
         try (FileChannel tmp = FileChannel.open(tmpFile,
                 StandardOpenOption.CREATE,
                 StandardOpenOption.WRITE,
@@ -190,53 +132,38 @@ final class WalManager implements Closeable {
             tmp.force(true);
         }
 
-        // Close the live channel so the rename can replace the file on Windows.
-        FileChannel live = channels.remove(safe);
+        FileChannel live = channels.remove(baseName);
         if (live != null) {
             try { live.close(); } catch (IOException ignored) {}
         }
 
-        // Atomically replace the active WAL.
         try {
             Files.move(tmpFile, walFile,
                     StandardCopyOption.REPLACE_EXISTING,
                     StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException ex) {
-            log.warn("ATOMIC_MOVE unavailable, falling back to non-atomic replace  room='{}'", roomId);
+            log.warn("ATOMIC_MOVE unavailable, falling back to non-atomic replace  room='{}' board='{}'",
+                    roomId, boardId);
             Files.move(tmpFile, walFile, StandardCopyOption.REPLACE_EXISTING);
         }
 
-        log.info("WAL compacted  room='{}' shapes={}", roomId, snapshot.size());
+        log.info("WAL compacted  room='{}' board='{}' shapes={}", roomId, boardId, snapshot.size());
     }
 
-    /**
-     * Returns the current on-disk size of the WAL file for {@code roomId}.
-     *
-     * <p>If the file does not yet exist (no appends have been made) the method
-     * returns {@code 0}.  When a {@link FileChannel} is open for this room its
-     * {@link FileChannel#size()} is used to avoid any OS-level caching artefacts.
-     *
-     * @param roomId the room; must not be {@code null} or blank
-     * @return current size in bytes, or {@code 0} if the file does not exist
-     * @throws IOException on I/O error
-     */
-    long walFileSize(String roomId) throws IOException {
-        validateRoomId(roomId);
+    long walFileSize(String roomId, String boardId) throws IOException {
+        validateNonBlank(roomId, "roomId");
+        validateNonBlank(boardId, "boardId");
 
-        String safe = sanitize(roomId);
-        FileChannel ch = channels.get(safe);
+        String baseName = walMapKey(roomId, boardId);
+        FileChannel ch = channels.get(baseName);
         if (ch != null && ch.isOpen()) {
             return ch.size();
         }
 
-        Path path = dataDir.resolve(safe + ".wal");
+        Path path = dataDir.resolve(baseName + ".wal");
         return Files.exists(path) ? Files.size(path) : 0L;
     }
 
-    /**
-     * Closes all open {@link FileChannel}s.  Idempotent — a second call is a
-     * safe no-op.
-     */
     @Override
     public void close() {
         if (closed) return;
@@ -245,45 +172,40 @@ final class WalManager implements Closeable {
             try {
                 entry.getValue().close();
             } catch (IOException e) {
-                log.warn("Error closing WAL channel  room='{}': {}", entry.getKey(), e.getMessage());
+                log.warn("Error closing WAL channel  key='{}': {}", entry.getKey(), e.getMessage());
             }
         }
         channels.clear();
         log.info("WalManager closed  dataDir='{}'", dataDir);
     }
 
-    // =========================================================================
-    // Internal helpers
-    // =========================================================================
-
-    /**
-     * Maps a {@code roomId} to a filesystem-safe name by replacing every
-     * character that is not alphanumeric, a dot, a hyphen, or an underscore
-     * with {@code '_'}.
-     */
-    private static String sanitize(String roomId) {
-        return roomId.replaceAll("[^A-Za-z0-9._-]", "_");
+    private static String sanitize(String id) {
+        return id.replaceAll("[^A-Za-z0-9._-]", "_");
     }
 
-    private Path walPath(String roomId) {
-        return dataDir.resolve(sanitize(roomId) + ".wal");
+    private static String walMapKey(String roomId, String boardId) {
+        return sanitize(roomId) + "_" + sanitize(boardId);
     }
 
-    private static void validateRoomId(String roomId) {
-        if (roomId == null || roomId.isBlank()) {
-            throw new IllegalArgumentException("roomId must not be null or blank");
+    private Path walPath(String roomId, String boardId) {
+        return dataDir.resolve(walMapKey(roomId, boardId) + ".wal");
+    }
+
+    private static void validateNonBlank(String value, String label) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(label + " must not be null or blank");
         }
     }
 
-    private FileChannel openChannel(String safeRoomId) {
+    private FileChannel openAppendChannel(String fileName) {
         try {
             return FileChannel.open(
-                    dataDir.resolve(safeRoomId + ".wal"),
+                    dataDir.resolve(fileName),
                     StandardOpenOption.CREATE,
                     StandardOpenOption.WRITE,
                     StandardOpenOption.APPEND);
         } catch (IOException e) {
-            throw new RuntimeException("Failed to open WAL channel for '" + safeRoomId + "'", e);
+            throw new RuntimeException("Failed to open WAL channel for '" + fileName + "'", e);
         }
     }
 }

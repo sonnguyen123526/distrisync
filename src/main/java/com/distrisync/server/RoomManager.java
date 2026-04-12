@@ -34,7 +34,7 @@ import java.util.function.Consumer;
  * <h2>WAL integration</h2>
  * An optional {@link WalManager} may be supplied at construction.  When present
  * each {@link #appendToWal} call persists the message before it is broadcast;
- * room construction replays the WAL so state survives server restarts.
+ * per-board state is replayed lazily when a board is first opened.
  *
  * <h2>Thread safety</h2>
  * All public methods are safe to call from multiple threads concurrently.
@@ -155,8 +155,8 @@ public final class RoomManager {
      * one if none exists.  The creation is atomic — concurrent callers always
      * receive the same instance.
      *
-     * <p>When this manager was constructed with a {@link WalManager} the new
-     * room's constructor will replay any existing WAL for this room ID.
+     * <p>When this manager was constructed with a {@link WalManager}, each board's
+     * WAL is replayed the first time {@link RoomContext#getBoard} opens that board.
      *
      * @param roomId non-null, non-blank room identifier
      * @return the canonical {@link RoomContext} for this room
@@ -192,7 +192,9 @@ public final class RoomManager {
      */
     public List<Shape> getRoomSnapshot(String roomId) {
         RoomContext room = getRoom(roomId);
-        return room != null ? room.stateManager.snapshot() : List.of();
+        return room != null
+                ? room.getBoard(MessageCodec.DEFAULT_INITIAL_BOARD_ID).snapshot()
+                : List.of();
     }
 
     // =========================================================================
@@ -261,21 +263,18 @@ public final class RoomManager {
     // =========================================================================
 
     /**
-     * Appends {@code msg} to the WAL for {@code roomId}.
+     * Appends {@code msg} to the WAL for {@code roomId} and {@code boardId}.
      *
      * <p>No-op if this manager was constructed without a {@link WalManager}.
      * I/O errors are logged but not re-thrown so that a WAL write failure
      * never disrupts the NIO event loop.
-     *
-     * @param roomId the room whose WAL receives the record
-     * @param msg    the message to persist
      */
-    public void appendToWal(String roomId, Message msg) {
+    public void appendToWal(String roomId, String boardId, Message msg) {
         if (walManager == null) return;
         try {
-            walManager.append(roomId, msg);
+            walManager.append(roomId, boardId, msg);
         } catch (IOException e) {
-            log.error("WAL append failed  room='{}': {}", roomId, e.getMessage(), e);
+            log.error("WAL append failed  room='{}' board='{}': {}", roomId, boardId, e.getMessage(), e);
         }
     }
 
