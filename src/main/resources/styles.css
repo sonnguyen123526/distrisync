@@ -41,12 +41,41 @@
     -fx-background-color: #2563eb;
 }
 
-/* ── Sidebar container ──────────────────────────────────────── */
+/* ── Sidebar container — fixed width so slide distance stays stable ─ */
 .sidebar {
     -fx-background-color: #0f172a;
     -fx-padding: 16;
-    -fx-min-height: 0;
-    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.22), 16, 0, 6, 0);
+    -fx-pref-width: 200;
+    -fx-min-width: 200;
+    -fx-max-width: 200;
+    -fx-effect: dropshadow(three-pass-box, rgba(0, 0, 0, 0.5), 15, 0, 0, 0);
+}
+
+/* Tab attached to the right edge of the sidebar */
+.sidebar-toggle-btn {
+    -fx-background-color: #1e293b;
+    -fx-text-fill: #ffffff;
+    -fx-padding: 8 12 8 12;
+    -fx-background-radius: 0 6 6 0;
+    -fx-border-width: 0;
+    -fx-font-size: 14px;
+    -fx-font-weight: bold;
+    -fx-cursor: hand;
+    -fx-min-width: 40;
+    -fx-alignment: center;
+}
+
+.sidebar-toggle-btn:hover {
+    -fx-background-color: #334155;
+}
+
+.sidebar-toggle-btn:armed {
+    -fx-background-color: #475569;
+}
+
+.sidebar-toggle-btn:selected {
+    -fx-background-color: #1e293b;
+    -fx-text-fill: #ffffff;
 }
 
 /* Scrollable tool area — keeps bottom actions on-screen */
@@ -176,7 +205,7 @@
 }
 
 .ghost-danger-button:hover {
-    -fx-background-color: #ffe4e6;
+    -fx-background-color: rgba(225, 29, 72, 0.12);
 }
 
 .ghost-danger-button:armed {
@@ -273,4 +302,138 @@
 .lobby-status-disconnected {
     -fx-text-fill: #f87171;
     -fx-font-size: 13px;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Canvas workspace — Figma-style tab bar (not TabPane)
+   ═══════════════════════════════════════════════════════════════ */
+
+.workspace-header {
+    -fx-background-color: #0f172a;
+    -fx-padding: 0 10 0 10;
+    -fx-border-color: #1e293b;
+    -fx-border-width: 0 0 1 0;
+}
+
+.workspace-tab {
+    -fx-background-color: transparent;
+    -fx-background-insets: 0;
+    -fx-text-fill: #94a3b8;
+    -fx-padding: 10 20 10 20;
+    -fx-cursor: hand;
+    -fx-border-width: 0 0 2 0;
+    -fx-border-color: transparent;
+    -fx-background-radius: 0;
+    -fx-focus-color: transparent;
+    -fx-faint-focus-color: transparent;
+}
+
+.workspace-tab:hover {
+    -fx-text-fill: #f8fafc;
+    -fx-background-color: #1e293b;
+}
+
+.workspace-tab.workspace-tab-active {
+    -fx-background-color: #1e293b;
+    -fx-text-fill: #3b82f6;
+    -fx-border-width: 0 0 2 0;
+    -fx-border-color: #3b82f6;
+    -fx-font-weight: bold;
+}
+
+.workspace-tab.workspace-tab-active:hover {
+    -fx-text-fill: #3b82f6;
+    -fx-background-color: #1e293b;
+}
+
+/* Floating Task View–style board switcher trigger (replaces tab bar) */
+.boards-switcher-trigger {
+    -fx-text-fill: #e2e8f0;
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+    -fx-padding: 8 18 8 18;
+    -fx-background-color: rgba(30, 41, 59, 0.92);
+    -fx-background-radius: 20;
+    -fx-border-color: rgba(148, 163, 184, 0.35);
+    -fx-border-radius: 20;
+    -fx-border-width: 1;
+    -fx-cursor: hand;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.45), 12, 0.2, 0, 2);
+}
+.boards-switcher-trigger:hover {
+    -fx-background-color: rgba(51, 65, 85, 0.95);
+    -fx-border-color: rgba(148, 163, 184, 0.55);
+}
+.boards-switcher-trigger:pressed {
+    -fx-background-color: rgba(15, 23, 42, 0.98);
+}
+
+.new-board-btn {
+    -fx-text-fill: #64748b;
+    -fx-background-color: transparent;
+    -fx-background-insets: 0;
+    -fx-font-size: 16px;
+    -fx-padding: 10 15 10 15;
+    -fx-cursor: hand;
+    -fx-border-width: 0;
+    -fx-background-radius: 0;
+    -fx-focus-color: transparent;
+    -fx-faint-focus-color: transparent;
+}
+
+.new-board-btn:hover {
+    -fx-text-fill: #10b981;
+}
+
+/* ── Workspace “new board” dialog (TextInputDialog) ───────────── */
+.workspace-input-dialog {
+    -fx-background-color: #0f172a;
+}
+
+.workspace-input-dialog .header-panel {
+    -fx-background-color: #0f172a;
+}
+
+.workspace-input-dialog .content.label {
+    -fx-text-fill: #e2e8f0;
+    -fx-font-size: 13px;
+}
+
+.workspace-input-dialog .text-field {
+    -fx-background-color: #1e293b;
+    -fx-text-fill: #f8fafc;
+    -fx-prompt-text-fill: #64748b;
+    -fx-border-color: #334155;
+    -fx-border-width: 1;
+    -fx-border-radius: 6;
+    -fx-background-radius: 6;
+    -fx-padding: 8 12 8 12;
+}
+
+.workspace-input-dialog .button {
+    -fx-cursor: hand;
+    -fx-background-radius: 6;
+    -fx-padding: 8 16 8 16;
+}
+
+.workspace-input-dialog .button:default {
+    -fx-background-color: #3b82f6;
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+}
+
+.workspace-input-dialog .button:default:hover {
+    -fx-background-color: #2563eb;
+}
+
+.workspace-input-dialog .button:not(:default) {
+    -fx-background-color: transparent;
+    -fx-text-fill: #94a3b8;
+    -fx-border-color: #475569;
+    -fx-border-width: 1;
+}
+
+.workspace-input-dialog .button:not(:default):hover {
+    -fx-background-color: #1e293b;
+    -fx-text-fill: #f8fafc;
 }

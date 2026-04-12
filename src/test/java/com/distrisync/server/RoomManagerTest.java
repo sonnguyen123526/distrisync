@@ -45,8 +45,8 @@ import static org.assertj.core.api.Assertions.*;
  *
  * <h2>Package access</h2>
  * This test class lives in the {@code com.distrisync.server} package so it
- * can read the package-private {@link RoomContext} fields
- * ({@code stateManager}, {@code getActiveKeys()}) and call
+ * can read the package-private {@link RoomContext} API
+ * ({@code getBoard}, {@code getActiveKeys()}) and call
  * {@link RoomContext#touchActivity()} without reflection.
  * Private fields ({@code lastActivityTimestamp}) and private methods
  * ({@code StorageLifecycleManager.runCycle()}) that are needed by lifecycle
@@ -247,29 +247,30 @@ class RoomManagerTest {
         room2.addKey(keyC);
 
         // ── 1. State manager identity — must be distinct objects ─────────────
-        assertThat(room1.stateManager)
+        String board = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+        assertThat(room1.getBoard(board))
                 .as("Room1 must have its own CanvasStateManager instance")
                 .isNotNull();
-        assertThat(room2.stateManager)
+        assertThat(room2.getBoard(board))
                 .as("Room2 must have its own CanvasStateManager instance")
                 .isNotNull();
-        assertThat(room1.stateManager)
+        assertThat(room1.getBoard(board))
                 .as("Room1 and Room2 must NOT share a CanvasStateManager — " +
                     "a mutation in one room must never affect the other")
-                .isNotSameAs(room2.stateManager);
+                .isNotSameAs(room2.getBoard(board));
 
         // ── 2. Canvas state isolation — apply a mutation in each room and
         //      verify neither snapshot leaks into the other room's view ────────
         UUID shapeInRoom1 = UUID.fromString("11111111-1111-1111-1111-111111111111");
         UUID shapeInRoom2 = UUID.fromString("22222222-2222-2222-2222-222222222222");
 
-        room1.stateManager.applyMutation(
+        room1.getBoard(board).applyMutation(
                 new Line(shapeInRoom1, 1000L, "#FF0000", 0, 0, 100, 100, 2.0, "Alice", "client-A"));
-        room2.stateManager.applyMutation(
+        room2.getBoard(board).applyMutation(
                 new Circle(shapeInRoom2, 2000L, "#0000FF", 50, 50, 25, false, 1.5, "Carol", "client-C"));
 
-        List<Shape> snap1 = room1.stateManager.snapshot();
-        List<Shape> snap2 = room2.stateManager.snapshot();
+        List<Shape> snap1 = room1.getBoard(board).snapshot();
+        List<Shape> snap2 = room2.getBoard(board).snapshot();
 
         assertThat(snap1)
                 .as("Room1's snapshot must contain exactly the one shape inserted into Room1")
@@ -369,7 +370,7 @@ class RoomManagerTest {
 
         // Client A commits one shape before disconnecting.
         UUID shapeByA = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
-        room1.stateManager.applyMutation(
+        room1.getBoard(MessageCodec.DEFAULT_INITIAL_BOARD_ID).applyMutation(
                 new Line(shapeByA, 1000L, "#FF0000", 0, 0, 50, 50, 1.0, "Alice", "client-A"));
 
         assertThat(room1.getActiveKeys())
@@ -393,7 +394,7 @@ class RoomManagerTest {
                 .hasSize(1);
 
         // ── 3. Canvas state unaffected by disconnect ─────────────────────────
-        List<Shape> snapshot = room1.stateManager.snapshot();
+        List<Shape> snapshot = room1.getBoard(MessageCodec.DEFAULT_INITIAL_BOARD_ID).snapshot();
         assertThat(snapshot)
                 .as("Room1's canvas must still contain the shape committed by Client A — " +
                     "disconnect must not retroactively delete shapes")
@@ -598,15 +599,16 @@ class RoomManagerTest {
         }
 
         // All three state managers must be distinct objects.
-        assertThat(rooms[0].stateManager)
+        String board = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+        assertThat(rooms[0].getBoard(board))
                 .as("Alpha and Beta must not share a state manager")
-                .isNotSameAs(rooms[1].stateManager);
-        assertThat(rooms[1].stateManager)
+                .isNotSameAs(rooms[1].getBoard(board));
+        assertThat(rooms[1].getBoard(board))
                 .as("Beta and Gamma must not share a state manager")
-                .isNotSameAs(rooms[2].stateManager);
-        assertThat(rooms[0].stateManager)
+                .isNotSameAs(rooms[2].getBoard(board));
+        assertThat(rooms[0].getBoard(board))
                 .as("Alpha and Gamma must not share a state manager")
-                .isNotSameAs(rooms[2].stateManager);
+                .isNotSameAs(rooms[2].getBoard(board));
 
         // Each room contains exactly its own key.
         for (int i = 0; i < 3; i++) {
@@ -823,7 +825,7 @@ class RoomManagerTest {
             assertThat(rejoinedRoom)
                     .as("getOrCreateRoom after eviction must return a non-null RoomContext")
                     .isNotNull();
-            assertThat(rejoinedRoom.stateManager.size())
+            assertThat(rejoinedRoom.getBoard(MessageCodec.DEFAULT_INITIAL_BOARD_ID).size())
                     .as("the re-created room must have an empty canvas — " +
                         "the WAL was archived during GC so no old shapes are replayed")
                     .isZero();
