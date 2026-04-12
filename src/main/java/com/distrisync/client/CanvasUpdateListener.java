@@ -19,6 +19,18 @@ import java.util.UUID;
 public interface CanvasUpdateListener {
 
     /**
+     * Fired on the {@code distrisync-read} thread when the client's workspace board
+     * selection or known-board list changes — for example after {@code JOIN_ROOM} /
+     * {@code SWITCH_BOARD} (local priming), or when a {@code BOARD_LIST_UPDATE}
+     * frame arrives from the server.  Implementations that touch JavaFX must marshal
+     * to the FX thread via {@code Platform.runLater}.
+     *
+     * @param currentBoardId authoritative active board id; may be empty in the lobby
+     * @param knownBoards    board ids the client is tracking for this session, in order
+     */
+    default void onWorkspaceStateChanged(String currentBoardId, List<String> knownBoards) {}
+
+    /**
      * Fired once after a successful (re)connect when the server sends the full
      * board state.  The supplied list is immutable and sorted by insertion order.
      *

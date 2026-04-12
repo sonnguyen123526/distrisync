@@ -23,8 +23,10 @@ import java.util.Map;
  * 0x0B        TEXT_UPDATE   – ephemeral live-typing event; relayed to all peers without persistence
  *                             payload: { objectId, clientId, x, y, currentText }
  * 0x0C        LOBBY_STATE   – server→client: JSON list of { roomId, userCount } for discovery
- * 0x0D        JOIN_ROOM     – client→server: JSON string roomId to leave lobby and enter a room
+ * 0x0D        JOIN_ROOM     – client→server: JSON object { roomId, initialBoardId? }; legacy JSON string roomId accepted
  * 0x0E        LEAVE_ROOM    – client→server: return to lobby (empty payload)
+ * 0x0F        SWITCH_BOARD      – client→server: JSON string target boardId (e.g. "Board-1")
+ * 0x10        BOARD_LIST_UPDATE – server→client: JSON array of board id strings active in the room
  * </pre>
  */
 public enum MessageType {
@@ -42,7 +44,9 @@ public enum MessageType {
     TEXT_UPDATE ((byte) 0x0B),
     LOBBY_STATE ((byte) 0x0C),
     JOIN_ROOM   ((byte) 0x0D),
-    LEAVE_ROOM  ((byte) 0x0E);
+    LEAVE_ROOM  ((byte) 0x0E),
+    SWITCH_BOARD((byte) 0x0F),
+    BOARD_LIST_UPDATE((byte) 0x10);
 
     private final byte wireCode;
 

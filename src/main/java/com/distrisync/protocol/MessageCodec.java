@@ -61,6 +61,11 @@ public final class MessageCodec {
      */
     public static final int LEGACY_CLIENT_READ_BUFFER_BYTES = 64 * 1024;
 
+    /**
+     * Default workspace board when {@link MessageType#JOIN_ROOM} omits {@code initialBoardId}.
+     */
+    public static final String DEFAULT_INITIAL_BOARD_ID = "Board-1";
+
     private static final Gson GSON = new GsonBuilder()
             .serializeNulls()
             .disableHtmlEscaping()
@@ -323,18 +328,97 @@ public final class MessageCodec {
     }
 
     /**
-     * Encodes {@code JOIN_ROOM} with a JSON string literal payload (same pattern as
-     * {@link #encodeClearUserShapes}).
+     * JSON body for {@link MessageType#JOIN_ROOM}: target room and optional initial board.
+     *
+     * @param roomId         non-blank room identifier
+     * @param initialBoardId board to open; if {@code null} or blank, {@link #DEFAULT_INITIAL_BOARD_ID} is used
+     */
+    public record JoinRoomPayload(String roomId, String initialBoardId) {}
+
+    /**
+     * Encodes {@code JOIN_ROOM} as {@code {"roomId":"..."}} (no {@code initialBoardId} field).
+     * The server defaults the board to {@link #DEFAULT_INITIAL_BOARD_ID}.
      */
     public static ByteBuffer encodeJoinRoom(String roomId) {
         if (roomId == null) throw new IllegalArgumentException("roomId must not be null");
-        return encode(new Message(MessageType.JOIN_ROOM, GSON.toJson(roomId)));
+        JsonObject o = new JsonObject();
+        o.addProperty("roomId", roomId);
+        return encode(new Message(MessageType.JOIN_ROOM, GSON.toJson(o)));
     }
 
-    public static String decodeJoinRoom(Message msg) {
+    /**
+     * Encodes {@code JOIN_ROOM} including {@code initialBoardId} when non-blank.
+     */
+    public static ByteBuffer encodeJoinRoom(String roomId, String initialBoardId) {
+        if (roomId == null) throw new IllegalArgumentException("roomId must not be null");
+        JsonObject o = new JsonObject();
+        o.addProperty("roomId", roomId);
+        if (initialBoardId != null && !initialBoardId.isBlank()) {
+            o.addProperty("initialBoardId", initialBoardId);
+        }
+        return encode(new Message(MessageType.JOIN_ROOM, GSON.toJson(o)));
+    }
+
+    /**
+     * Parses {@code JOIN_ROOM} payload: JSON object {@code { roomId, initialBoardId? }}, or a legacy
+     * JSON string room id. Missing or blank {@code initialBoardId} defaults to {@link #DEFAULT_INITIAL_BOARD_ID}.
+     */
+    public static JoinRoomPayload decodeJoinRoom(Message msg) {
         if (msg == null) throw new IllegalArgumentException("msg must not be null");
         if (msg.type() != MessageType.JOIN_ROOM) {
             throw new IllegalArgumentException("expected JOIN_ROOM, got " + msg.type());
+        }
+        String raw = msg.payload();
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalArgumentException("JOIN_ROOM payload is blank");
+        }
+        try {
+            var el = JsonParser.parseString(raw.strip());
+            if (el.isJsonPrimitive() && el.getAsJsonPrimitive().isString()) {
+                String rid = el.getAsString().strip();
+                if (rid.isBlank()) {
+                    throw new IllegalArgumentException("JOIN_ROOM room id is blank");
+                }
+                return new JoinRoomPayload(rid, DEFAULT_INITIAL_BOARD_ID);
+            }
+            if (el.isJsonObject()) {
+                JsonObject o = el.getAsJsonObject();
+                if (!o.has("roomId") || o.get("roomId").isJsonNull()) {
+                    throw new IllegalArgumentException("JOIN_ROOM missing roomId");
+                }
+                String rid = o.get("roomId").getAsString().strip();
+                if (rid.isBlank()) {
+                    throw new IllegalArgumentException("JOIN_ROOM room id is blank");
+                }
+                String board = DEFAULT_INITIAL_BOARD_ID;
+                if (o.has("initialBoardId") && !o.get("initialBoardId").isJsonNull()) {
+                    String ib = o.get("initialBoardId").getAsString().strip();
+                    if (!ib.isBlank()) {
+                        board = ib;
+                    }
+                }
+                return new JoinRoomPayload(rid, board);
+            }
+        } catch (IllegalArgumentException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Malformed JOIN_ROOM: " + e.getMessage(), e);
+        }
+        throw new IllegalArgumentException("JOIN_ROOM payload must be a JSON string or object with roomId");
+    }
+
+    /**
+     * Encodes {@code SWITCH_BOARD} with a JSON string literal payload (the target {@code boardId}).
+     */
+    public static ByteBuffer encodeSwitchBoard(String boardId) {
+        if (boardId == null) throw new IllegalArgumentException("boardId must not be null");
+        return encode(new Message(MessageType.SWITCH_BOARD, GSON.toJson(boardId)));
+    }
+
+    public static String decodeSwitchBoard(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.SWITCH_BOARD) {
+            throw new IllegalArgumentException("expected SWITCH_BOARD, got " + msg.type());
         }
         return GSON.fromJson(msg.payload(), String.class);
     }
@@ -342,6 +426,34 @@ public final class MessageCodec {
     /** Encodes {@code LEAVE_ROOM} with an empty UTF-8 payload body. */
     public static ByteBuffer encodeLeaveRoom() {
         return encode(new Message(MessageType.LEAVE_ROOM, ""));
+    }
+
+    // -------------------------------------------------------------------------
+    // BOARD_LIST_UPDATE (server → client)
+    // -------------------------------------------------------------------------
+
+    private static final Type BOARD_ID_LIST_TYPE = new TypeToken<List<String>>() {}.getType();
+
+    /**
+     * Encodes {@code BOARD_LIST_UPDATE}: a JSON array of board id strings, e.g.
+     * {@code ["Default","Diagrams","Math"]}.
+     */
+    public static ByteBuffer encodeBoardListUpdate(List<String> boardIds) {
+        if (boardIds == null) throw new IllegalArgumentException("boardIds must not be null");
+        String json = GSON.toJson(boardIds);
+        return encode(new Message(MessageType.BOARD_LIST_UPDATE, json));
+    }
+
+    /**
+     * Decodes the payload of a {@link MessageType#BOARD_LIST_UPDATE} message.
+     */
+    public static List<String> decodeBoardListUpdate(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.BOARD_LIST_UPDATE) {
+            throw new IllegalArgumentException("expected BOARD_LIST_UPDATE, got " + msg.type());
+        }
+        List<String> list = GSON.fromJson(msg.payload(), BOARD_ID_LIST_TYPE);
+        return list != null ? List.copyOf(list) : List.of();
     }
 
     // -------------------------------------------------------------------------

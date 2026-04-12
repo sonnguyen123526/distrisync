@@ -132,11 +132,39 @@ class MessageCodecTest {
     }
 
     @Test
-    void joinRoom_roundTrip() {
+    void joinRoom_roundTrip_objectPayload_defaultsBoard() {
         ByteBuffer frame = MessageCodec.encodeJoinRoom("my-room");
         Message msg = MessageCodec.decode(frame);
         assertThat(msg.type()).isEqualTo(MessageType.JOIN_ROOM);
-        assertThat(MessageCodec.decodeJoinRoom(msg)).isEqualTo("my-room");
+        MessageCodec.JoinRoomPayload jp = MessageCodec.decodeJoinRoom(msg);
+        assertThat(jp.roomId()).isEqualTo("my-room");
+        assertThat(jp.initialBoardId()).isEqualTo(MessageCodec.DEFAULT_INITIAL_BOARD_ID);
+    }
+
+    @Test
+    void joinRoom_decode_legacyJsonStringRoomId() {
+        String legacy = MessageCodec.gson().toJson("legacy-room");
+        Message msg = new Message(MessageType.JOIN_ROOM, legacy);
+        MessageCodec.JoinRoomPayload jp = MessageCodec.decodeJoinRoom(msg);
+        assertThat(jp.roomId()).isEqualTo("legacy-room");
+        assertThat(jp.initialBoardId()).isEqualTo(MessageCodec.DEFAULT_INITIAL_BOARD_ID);
+    }
+
+    @Test
+    void joinRoom_roundTrip_withInitialBoard() {
+        ByteBuffer frame = MessageCodec.encodeJoinRoom("r1", "Board-2");
+        Message msg = MessageCodec.decode(frame);
+        MessageCodec.JoinRoomPayload jp = MessageCodec.decodeJoinRoom(msg);
+        assertThat(jp.roomId()).isEqualTo("r1");
+        assertThat(jp.initialBoardId()).isEqualTo("Board-2");
+    }
+
+    @Test
+    void switchBoard_roundTrip() {
+        ByteBuffer frame = MessageCodec.encodeSwitchBoard("Board-1");
+        Message msg = MessageCodec.decode(frame);
+        assertThat(msg.type()).isEqualTo(MessageType.SWITCH_BOARD);
+        assertThat(MessageCodec.decodeSwitchBoard(msg)).isEqualTo("Board-1");
     }
 
     @Test
@@ -145,6 +173,15 @@ class MessageCodecTest {
         Message msg = MessageCodec.decode(frame);
         assertThat(msg.type()).isEqualTo(MessageType.LEAVE_ROOM);
         assertThat(msg.payload()).isEmpty();
+    }
+
+    @Test
+    void boardListUpdate_roundTrip() {
+        List<String> in = List.of("Default", "Diagrams", "Math");
+        ByteBuffer frame = MessageCodec.encodeBoardListUpdate(in);
+        Message msg = MessageCodec.decode(frame);
+        assertThat(msg.type()).isEqualTo(MessageType.BOARD_LIST_UPDATE);
+        assertThat(MessageCodec.decodeBoardListUpdate(msg)).containsExactlyElementsOf(in);
     }
 
     // =========================================================================
