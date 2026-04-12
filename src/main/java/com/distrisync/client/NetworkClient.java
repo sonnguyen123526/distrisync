@@ -114,6 +114,26 @@ public final class NetworkClient implements AutoCloseable {
      */
     private volatile String activeRoomId = "";
 
+    /**
+     * Active workspace board id while in a room; empty in the lobby. Updated when
+     * switching boards and when a {@code SNAPSHOT} arrives (aligned with
+     * {@link #lastSnapshotBoardId}).
+     */
+    private volatile String currentBoardId = "";
+
+    /**
+     * Active board ids for the current room, kept in sync with the server's
+     * {@link MessageType#BOARD_LIST_UPDATE} payloads (authoritative). Also primed locally
+     * on {@link #sendJoinRoom} / {@link #sendSwitchBoard} until the next server update.
+     */
+    private final List<String> knownBoards = new CopyOnWriteArrayList<>();
+
+    /**
+     * Board id the server will use for the next {@code SNAPSHOT} — set on
+     * {@code JOIN_ROOM} / {@code SWITCH_BOARD} and applied when the snapshot is decoded.
+     */
+    private volatile String lastSnapshotBoardId = "";
+
     /** Thread-safe listener registry; copy-on-write for lock-free iteration. */
     private final CopyOnWriteArrayList<CanvasUpdateListener> listeners =
             new CopyOnWriteArrayList<>();
@@ -143,6 +163,12 @@ public final class NetworkClient implements AutoCloseable {
      * held here and sent when {@link #noteProtocolReady} runs.
      */
     private volatile String deferredJoinRoomId = "";
+
+    /**
+     * When non-blank, deferred join uses {@link MessageCodec#encodeJoinRoom(String, String)}.
+     * Blank means {@link MessageCodec#encodeJoinRoom(String)} (server default board).
+     */
+    private volatile String deferredJoinBoardId = "";
 
     /**
      * Reference to the write daemon thread so that producers can
@@ -226,6 +252,8 @@ public final class NetworkClient implements AutoCloseable {
         try {
             protocolReady.set(false);
             deferredJoinRoomId = "";
+            deferredJoinBoardId = "";
+            resetWorkspaceForLobby();
             channel = connectWithBackoff();
             sendHandshake();
             startWriteThread();
@@ -376,6 +404,20 @@ public final class NetworkClient implements AutoCloseable {
         return activeRoomId;
     }
 
+    /** Active workspace board while in a room; empty in the lobby. */
+    public String getCurrentBoardId() {
+        String s = currentBoardId;
+        return s != null ? s : "";
+    }
+
+    /**
+     * Board ids for the current workspace, aligned with the latest
+     * {@code BOARD_LIST_UPDATE} from the server while in a room.
+     */
+    public List<String> getKnownBoards() {
+        return List.copyOf(knownBoards);
+    }
+
     /** {@code true} while TCP I/O threads are running after a successful {@link #connect()}. */
     public boolean isRunning() {
         return running.get();
@@ -442,6 +484,30 @@ public final class NetworkClient implements AutoCloseable {
         if (wt != null) LockSupport.unpark(wt);
 
         log.info("NetworkClient closed");
+    }
+
+    private void resetWorkspaceForLobby() {
+        knownBoards.clear();
+        currentBoardId = "";
+        lastSnapshotBoardId = "";
+        notifyWorkspaceListeners();
+    }
+
+    private void ensureBoardKnown(String boardId) {
+        if (boardId == null || boardId.isBlank()) {
+            return;
+        }
+        if (!knownBoards.contains(boardId)) {
+            knownBoards.add(boardId);
+        }
+    }
+
+    private void notifyWorkspaceListeners() {
+        List<String> copy = List.copyOf(knownBoards);
+        String cur = currentBoardId != null ? currentBoardId : "";
+        for (CanvasUpdateListener listener : listeners) {
+            listener.onWorkspaceStateChanged(cur, copy);
+        }
     }
 
     // =========================================================================
@@ -524,13 +590,76 @@ public final class NetworkClient implements AutoCloseable {
             return;
         }
         activeRoomId = rid;
+        lastSnapshotBoardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+        currentBoardId = lastSnapshotBoardId;
+        ensureBoardKnown(lastSnapshotBoardId);
+        notifyWorkspaceListeners();
         if (protocolReady.get()) {
             enqueueFrame(MessageCodec.encodeJoinRoom(rid));
             log.debug("JOIN_ROOM enqueued roomId='{}'", rid);
         } else {
             deferredJoinRoomId = rid;
+            deferredJoinBoardId = "";
             log.debug("JOIN_ROOM deferred until protocol ready roomId='{}'", rid);
         }
+    }
+
+    /**
+     * Enters a room on a specific workspace board (async). The server responds with
+     * {@code SNAPSHOT} for that board.
+     *
+     * @param roomId          non-blank room identifier
+     * @param initialBoardId  non-blank board id (e.g. {@code "Math-Notes"})
+     */
+    public void sendJoinRoom(String roomId, String initialBoardId) {
+        if (!running.get()) return;
+        String rid = roomId != null ? roomId.strip() : "";
+        if (rid.isBlank()) {
+            log.debug("sendJoinRoom ignored — blank roomId");
+            return;
+        }
+        String board = initialBoardId != null ? initialBoardId.strip() : "";
+        if (board.isBlank()) {
+            log.debug("sendJoinRoom ignored — blank initialBoardId");
+            return;
+        }
+        activeRoomId = rid;
+        lastSnapshotBoardId = board;
+        currentBoardId = board;
+        ensureBoardKnown(board);
+        notifyWorkspaceListeners();
+        if (protocolReady.get()) {
+            enqueueFrame(MessageCodec.encodeJoinRoom(rid, board));
+            log.debug("JOIN_ROOM enqueued roomId='{}' boardId='{}'", rid, board);
+        } else {
+            deferredJoinRoomId = rid;
+            deferredJoinBoardId = board;
+            log.debug("JOIN_ROOM deferred until protocol ready roomId='{}' boardId='{}'", rid, board);
+        }
+    }
+
+    /**
+     * Switches the active board within the current room (async). The server sends a fresh
+     * {@code SNAPSHOT} for {@code boardId}. No-op when not connected or when {@code boardId} is blank.
+     */
+    public void sendSwitchBoard(String boardId) {
+        if (!running.get()) return;
+        String rid = activeRoomId;
+        if (rid == null || rid.isBlank()) {
+            log.debug("sendSwitchBoard ignored — not in a room");
+            return;
+        }
+        String bid = boardId != null ? boardId.strip() : "";
+        if (bid.isBlank()) {
+            log.debug("sendSwitchBoard ignored — blank boardId");
+            return;
+        }
+        currentBoardId = bid;
+        lastSnapshotBoardId = bid;
+        ensureBoardKnown(bid);
+        notifyWorkspaceListeners();
+        enqueueFrame(MessageCodec.encodeSwitchBoard(bid));
+        log.debug("SWITCH_BOARD enqueued boardId='{}'", bid);
     }
 
     /**
@@ -549,6 +678,7 @@ public final class NetworkClient implements AutoCloseable {
     public void sendLeaveRoom() {
         if (!running.get()) return;
         activeRoomId = "";
+        resetWorkspaceForLobby();
         enqueueFrame(MessageCodec.encodeLeaveRoom());
         log.debug("LEAVE_ROOM enqueued");
     }
@@ -586,6 +716,7 @@ public final class NetworkClient implements AutoCloseable {
     private synchronized void reconnect() throws IOException {
         protocolReady.set(false);
         deferredJoinRoomId = "";
+        deferredJoinBoardId = "";
         SocketChannel stale = channel;
         if (stale != null) {
             try { stale.close(); } catch (IOException ignored) {}
@@ -595,6 +726,10 @@ public final class NetworkClient implements AutoCloseable {
         String rid = activeRoomId;
         if (rid != null && !rid.isBlank()) {
             sendJoinRoomBlocking(rid);
+            lastSnapshotBoardId = MessageCodec.DEFAULT_INITIAL_BOARD_ID;
+            currentBoardId = lastSnapshotBoardId;
+            ensureBoardKnown(lastSnapshotBoardId);
+            notifyWorkspaceListeners();
             protocolReady.set(true);
             log.info("Reconnected to {}:{} — HANDSHAKE + JOIN_ROOM roomId='{}'", host, port, rid);
         } else {
@@ -704,9 +839,14 @@ public final class NetworkClient implements AutoCloseable {
         }
         String rid = deferredJoinRoomId;
         deferredJoinRoomId = "";
+        String board = deferredJoinBoardId;
+        deferredJoinBoardId = "";
         if (rid != null && !rid.isBlank()) {
-            enqueueFrame(MessageCodec.encodeJoinRoom(rid));
-            log.debug("Flushed deferred JOIN_ROOM roomId='{}'", rid);
+            ByteBuffer frame = (board != null && !board.isBlank())
+                    ? MessageCodec.encodeJoinRoom(rid, board)
+                    : MessageCodec.encodeJoinRoom(rid);
+            enqueueFrame(frame);
+            log.debug("Flushed deferred JOIN_ROOM roomId='{}' boardId='{}'", rid, board);
         }
     }
 
@@ -721,6 +861,10 @@ public final class NetworkClient implements AutoCloseable {
                     break;
                 }
                 noteProtocolReady();
+                if (!lastSnapshotBoardId.isBlank()) {
+                    currentBoardId = lastSnapshotBoardId;
+                    ensureBoardKnown(currentBoardId);
+                }
                 log.info("SNAPSHOT received: {} shape(s)", shapes.size());
                 for (CanvasUpdateListener listener : listeners) {
                     listener.onSnapshotReceived(shapes);
@@ -834,6 +978,29 @@ public final class NetworkClient implements AutoCloseable {
             }
             case JOIN_ROOM, LEAVE_ROOM ->
                     log.trace("Ignoring echoed client-bound message type: {}", msg.type());
+            case BOARD_LIST_UPDATE -> {
+                if (activeRoomId == null || activeRoomId.isBlank()) {
+                    log.trace("BOARD_LIST_UPDATE ignored — not in a room");
+                    break;
+                }
+                try {
+                    List<String> ids = MessageCodec.decodeBoardListUpdate(msg);
+                    knownBoards.clear();
+                    for (String id : ids) {
+                        if (id == null) {
+                            continue;
+                        }
+                        String bid = id.strip();
+                        if (!bid.isEmpty()) {
+                            knownBoards.add(bid);
+                        }
+                    }
+                    log.debug("BOARD_LIST_UPDATE applied  boardCount={}", knownBoards.size());
+                    notifyWorkspaceListeners();
+                } catch (Exception e) {
+                    log.debug("Malformed BOARD_LIST_UPDATE ignored: {}", e.getMessage());
+                }
+            }
             default -> log.warn("Ignoring unexpected inbound message type={} — check client/server versions",
                     msg.type());
         }
