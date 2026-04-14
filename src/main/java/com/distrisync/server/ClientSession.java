@@ -1,5 +1,6 @@
 package com.distrisync.server;
 
+import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -56,6 +57,16 @@ final class ClientSession {
      * Set after the first {@code HANDSHAKE} is accepted; duplicate handshakes are ignored.
      */
     volatile boolean handshakeComplete = false;
+
+    /**
+     * Opaque token for the UDP audio data plane; issued on successful {@code JOIN_ROOM}.
+     */
+    volatile String udpToken = "";
+
+    /**
+     * Client UDP endpoint after a 36-byte token registration datagram; {@code null} until registered.
+     */
+    volatile InetSocketAddress udpEndpoint = null;
 
     /**
      * Accumulation buffer for inbound bytes.

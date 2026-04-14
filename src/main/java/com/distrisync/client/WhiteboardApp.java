@@ -8,12 +8,13 @@ import com.distrisync.model.TextNode;
 import javafx.animation.Animation;
 import javafx.animation.AnimationTimer;
 import javafx.animation.FadeTransition;
-import javafx.animation.Interpolator;
 import javafx.animation.PauseTransition;
+import javafx.animation.ScaleTransition;
 import javafx.animation.TranslateTransition;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
+import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
 import javafx.geometry.Rectangle2D;
 import javafx.scene.Cursor;
@@ -28,16 +29,19 @@ import javafx.scene.control.ColorPicker;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
 import javafx.scene.control.ScrollPane;
+import javafx.scene.control.Separator;
 import javafx.scene.control.Slider;
 import javafx.scene.control.TextField;
 import javafx.scene.control.TextInputDialog;
+import javafx.scene.control.Toggle;
 import javafx.scene.control.ToggleButton;
 import javafx.scene.control.ToggleGroup;
 import javafx.scene.control.Tooltip;
 import javafx.scene.input.KeyCode;
+import javafx.scene.input.KeyEvent;
+import javafx.scene.control.TextInputControl;
 import javafx.util.Duration;
 import javafx.scene.Parent;
-import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Pane;
@@ -116,8 +120,6 @@ public class WhiteboardApp extends Application {
     private static final String TOOLBAR_BG   = "#2C2F33";
 
     // ── toolbar geometry ──────────────────────────────────────────────────────
-    private static final double TOOLBAR_WIDTH = 200.0;
-
     // ── drawing constants ─────────────────────────────────────────────────────
     private static final double MIN_DRAG_DIST     = 2.0;
     private static final double MIN_FREEHAND_STEP = 4.0;
@@ -144,6 +146,15 @@ public class WhiteboardApp extends Application {
     private ColorPicker colorPicker;
     private Slider      strokeSlider;
     private Label       statusLabel;
+    private final ToolsDrawerToggleModel toolsDrawerToggleModel = new ToolsDrawerToggleModel();
+    private TranslateTransition toolsDrawerSlideTransition;
+    /** Tools-island toggle group and buttons (for shortcuts + programmatic selection). */
+    private ToggleGroup canvasToolGroup;
+    private ToggleButton canvasToolLine;
+    private ToggleButton canvasToolCircle;
+    private ToggleButton canvasToolPen;
+    private ToggleButton canvasToolEraser;
+    private ToggleButton canvasToolText;
 
     // ── shape-ownership tooltip (shown on hover over committed shapes) ─────────
     private Tooltip ownerTooltip;
@@ -156,6 +167,16 @@ public class WhiteboardApp extends Application {
     private int               networkPort = DEFAULT_PORT;
     /** Fires if we stay on the lobby after requesting a room join (no SNAPSHOT). */
     private PauseTransition   lobbyJoinWatchdog;
+
+    /** Bottom-center push-to-talk status chip on the canvas scene. */
+    private Label             pttIndicatorLabel;
+    /** Reverts {@link #pttIndicatorLabel} after remote audio gaps (no UDP packets). */
+    private PauseTransition   pttRemoteSilenceTimer;
+    /** PTT chip scale pulse; stopped before starting a new one to avoid stacking transforms. */
+    private ScaleTransition   pttScaleTransition;
+
+    private static final String PTT_DEFAULT_TEXT      = "[ MIC ] SPACE TO SPEAK";
+    private static final String PTT_TRANSMITTING_TEXT = "[ ON AIR ] TRANSMITTING...";
 
     // ── user identity (name from dialog); room title updated after JOIN_ROOM ─
     private String authorName = "Anonymous";
@@ -181,8 +202,6 @@ public class WhiteboardApp extends Application {
     private Animation snapshotHydrationAnimation;
     /** Bumped on each SNAPSHOT so stale fade callbacks do not paint after a newer snapshot. */
     private long snapshotHydrationToken;
-    /** Collapsible tools sidebar — open by default; slides off-screen when collapsed. */
-    private boolean isSidebarOpen = true;
     private VBox    lobbyRoomList;
     private Label   lobbyEmptyStateLabel;
     private Label   lobbyStatusLabel;
@@ -276,76 +295,68 @@ public class WhiteboardApp extends Application {
         controlPane.prefWidthProperty().bind(canvasStackPane.widthProperty());
         controlPane.prefHeightProperty().bind(canvasStackPane.heightProperty());
 
-        VBox canvasColumn = new VBox(canvasStackPane);
-        VBox.setVgrow(canvasStackPane, Priority.ALWAYS);
-        canvasColumn.setMaxWidth(Double.MAX_VALUE);
-        canvasColumn.setMaxHeight(Double.MAX_VALUE);
-
-        // ── Root layout — StackPane: canvas fills; sidebar + toggle float TOP_LEFT ─
+        // ── Root layout — StackPane: full-bleed canvas layer + floating HUD islands ─
         canvasSceneRoot = new StackPane();
         canvasSceneRoot.setStyle("-fx-background-color: " + BG_BASE + ";");
 
-        BorderPane sidebarPane = buildToolbar();
-
-        ToggleButton sidebarToggle = new ToggleButton("<<");
-        sidebarToggle.setFocusTraversable(false);
-        sidebarToggle.getStyleClass().add("sidebar-toggle-btn");
-        sidebarToggle.setMnemonicParsing(false);
-        sidebarToggle.setSelected(true);
-
-        HBox sidebarOverlay = new HBox(0, sidebarPane, sidebarToggle);
-        sidebarOverlay.setAlignment(Pos.TOP_LEFT);
-        sidebarOverlay.setPickOnBounds(false);
-        sidebarOverlay.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
-        sidebarPane.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
-        sidebarPane.maxHeightProperty().bind(canvasSceneRoot.heightProperty());
-        sidebarPane.minHeightProperty().bind(canvasSceneRoot.heightProperty());
-
-        TranslateTransition sidebarSlide = new TranslateTransition(Duration.millis(250), sidebarOverlay);
-        sidebarSlide.setInterpolator(Interpolator.EASE_BOTH);
-        sidebarToggle.setOnAction(e -> {
-            sidebarSlide.stop();
-            double w = sidebarPane.getWidth();
-            if (w <= 0 || Double.isNaN(w)) {
-                w = TOOLBAR_WIDTH;
-            }
-            isSidebarOpen = sidebarToggle.isSelected();
-            if (isSidebarOpen) {
-                sidebarSlide.setToX(0);
-                sidebarToggle.setText("<<");
-            } else {
-                sidebarSlide.setToX(-w);
-                sidebarToggle.setText(">>");
-            }
-            sidebarSlide.play();
-        });
+        Pane canvasWrapper = new Pane(canvasStackPane);
+        canvasStackPane.prefWidthProperty().bind(canvasWrapper.widthProperty());
+        canvasStackPane.prefHeightProperty().bind(canvasWrapper.heightProperty());
+        canvasWrapper.prefWidthProperty().bind(canvasSceneRoot.widthProperty());
+        canvasWrapper.prefHeightProperty().bind(canvasSceneRoot.heightProperty());
+        canvasWrapper.maxWidthProperty().bind(canvasSceneRoot.widthProperty());
+        canvasWrapper.maxHeightProperty().bind(canvasSceneRoot.heightProperty());
 
         buildBoardSwitcherOverlay();
 
-        StackPane boardsBtnLayer = new StackPane();
-        boardsBtnLayer.setPickOnBounds(false);
-        boardsBtnLayer.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+        HBox boardsIsland = new HBox();
+        boardsIsland.getStyleClass().add("hud-panel");
+        boardsIsland.setAlignment(Pos.CENTER_LEFT);
+        boardsIsland.setPickOnBounds(false);
         Button boardsTrigger = new Button("Boards ▾");
         boardsTrigger.setFocusTraversable(false);
         boardsTrigger.setMnemonicParsing(false);
-        boardsTrigger.getStyleClass().add("boards-switcher-trigger");
-        StackPane.setAlignment(boardsTrigger, Pos.TOP_CENTER);
-        StackPane.setMargin(boardsTrigger, new Insets(10, 0, 0, 0));
+        boardsTrigger.getStyleClass().add("hud-inline-action");
         boardsTrigger.setOnAction(e -> toggleBoardSwitcher());
-        boardsBtnLayer.getChildren().add(boardsTrigger);
+        boardsIsland.getChildren().add(boardsTrigger);
+        boardsIsland.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        StackPane.setAlignment(boardsIsland, Pos.TOP_LEFT);
+        StackPane.setMargin(boardsIsland, new Insets(20));
 
-        canvasSceneRoot.getChildren().addAll(canvasColumn, sidebarOverlay, boardsBtnLayer);
-        StackPane.setAlignment(canvasColumn, Pos.TOP_LEFT);
-        StackPane.setAlignment(sidebarOverlay, Pos.TOP_LEFT);
+        HBox toolDrawer = buildToolDrawer();
+        StackPane.setAlignment(toolDrawer, Pos.CENTER_LEFT);
+        StackPane.setMargin(toolDrawer, new Insets(20, 20, 20, 0));
+
+        HBox topRightIsland = buildTopRightHud();
+        topRightIsland.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        StackPane.setAlignment(topRightIsland, Pos.TOP_RIGHT);
+        StackPane.setMargin(topRightIsland, new Insets(20));
+
+        pttRemoteSilenceTimer = new PauseTransition(Duration.millis(500));
+        pttRemoteSilenceTimer.setOnFinished(ev -> revertPttIndicatorAfterRemoteGap());
+
+        pttIndicatorLabel = new Label(PTT_DEFAULT_TEXT);
+        pttIndicatorLabel.getStyleClass().add("ptt-indicator");
+        pttIndicatorLabel.setMouseTransparent(true);
+        pttIndicatorLabel.setScaleX(1.0);
+        pttIndicatorLabel.setScaleY(1.0);
+
+        HBox pttHud = new HBox(pttIndicatorLabel);
+        pttHud.getStyleClass().addAll("hud-panel", "ptt-hud-shell");
+        pttHud.setAlignment(Pos.CENTER);
+        pttHud.setPickOnBounds(false);
+        pttHud.setMouseTransparent(true);
+        pttHud.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        StackPane.setAlignment(pttHud, Pos.BOTTOM_CENTER);
+        StackPane.setMargin(pttHud, new Insets(0, 0, 30, 0));
+
+        canvasSceneRoot.getChildren().addAll(canvasWrapper, boardsIsland, toolDrawer, topRightIsland, pttHud);
 
         // ── Ownership tooltip — shown when hovering over a committed shape ────
         ownerTooltip = new Tooltip();
-        ownerTooltip.setShowDelay(Duration.millis(350));
-        ownerTooltip.setHideDelay(Duration.ZERO);
+        ownerTooltip.setShowDelay(Duration.millis(200));
+        ownerTooltip.setHideDelay(Duration.millis(100));
         ownerTooltip.setShowDuration(Duration.seconds(6));
-        ownerTooltip.setStyle(
-            "-fx-background-color: #313244; -fx-text-fill: #cdd6f4;" +
-            "-fx-font-size: 12px; -fx-padding: 5 9; -fx-background-radius: 6;");
 
         double canvasW = Math.clamp(visual.getWidth() * 0.92, 640, 1400);
         double canvasH = Math.clamp(visual.getHeight() * 0.90, 420, 920);
@@ -353,12 +364,39 @@ public class WhiteboardApp extends Application {
         canvasH = Math.min(canvasH, visual.getHeight() - 32);
         canvasScene = new Scene(canvasSceneRoot, canvasW, canvasH);
         canvasScene.getStylesheets().add(getClass().getResource("/styles.css").toExternalForm());
+        attachPttKeyEventFilters(canvasScene);
 
-        // ── Canvas scene shortcuts: undo, board switcher, dismiss overlay ───────
+        // ── Canvas scene shortcuts: tools, undo, board switcher, dismiss overlay ─
         canvasScene.setOnKeyPressed(e -> {
             if (e.isControlDown() && e.getCode() == KeyCode.Z) {
                 undoLastShape();
                 return;
+            }
+            if (!(e.getTarget() instanceof TextInputControl)
+                    && !e.isAltDown() && !e.isControlDown() && !e.isMetaDown() && !e.isShortcutDown()) {
+                switch (e.getCode()) {
+                    case L -> {
+                        activateCanvasTool(Tool.LINE, canvasToolLine);
+                        e.consume();
+                    }
+                    case O -> {
+                        activateCanvasTool(Tool.CIRCLE, canvasToolCircle);
+                        e.consume();
+                    }
+                    case P -> {
+                        activateCanvasTool(Tool.FREEHAND, canvasToolPen);
+                        e.consume();
+                    }
+                    case E -> {
+                        activateCanvasTool(Tool.ERASER, canvasToolEraser);
+                        e.consume();
+                    }
+                    case T -> {
+                        activateCanvasTool(Tool.TEXT, canvasToolText);
+                        e.consume();
+                    }
+                    default -> { /* fall through */ }
+                }
             }
             if (e.getCode() == KeyCode.ESCAPE && isBoardSwitcherShowing()) {
                 hideBoardSwitcher();
@@ -468,10 +506,12 @@ public class WhiteboardApp extends Application {
         backdrop.setOnMouseClicked(e -> hideBoardSwitcher());
 
         switcherBoardGrid = new FlowPane();
-        switcherBoardGrid.setHgap(20);
-        switcherBoardGrid.setVgap(20);
+        switcherBoardGrid.setOrientation(Orientation.HORIZONTAL);
         switcherBoardGrid.setAlignment(Pos.CENTER);
-        switcherBoardGrid.setMaxWidth(Region.USE_PREF_SIZE);
+        switcherBoardGrid.setHgap(25);
+        switcherBoardGrid.setVgap(25);
+        switcherBoardGrid.setPrefWrapLength(1000);
+        switcherBoardGrid.setMaxWidth(1000);
 
         switcherOverlay = new StackPane(backdrop, switcherBoardGrid);
         switcherOverlay.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
@@ -575,32 +615,34 @@ public class WhiteboardApp extends Application {
     }
 
     private VBox createBoardSwitcherCard(String boardId) {
-        VBox card = new VBox(10);
-        card.setPadding(new Insets(14));
+        VBox card = new VBox(4);
+        card.setMinSize(240, 160);
+        card.setMaxSize(240, 160);
+        card.setPadding(new Insets(4, 10, 4, 10));
         card.setAlignment(Pos.TOP_CENTER);
-        card.setMinWidth(220);
-        card.setStyle(
-                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;");
         String normalShadow = "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);";
         String hoverShadow = "-fx-effect: dropshadow(gaussian, rgba(148,163,184,0.45), 14, 0.25, 0, 2);";
-        card.setStyle(card.getStyle() + normalShadow);
+        String baseChrome =
+                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;"
+                        + "-fx-border-radius: 12; -fx-border-width: 2; ";
+        card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
 
         StackPane thumb = new StackPane();
-        thumb.setPrefSize(200, 150);
-        thumb.setMinSize(200, 150);
-        thumb.setMaxSize(200, 150);
+        thumb.setPrefSize(220, 124);
+        thumb.setMinSize(220, 124);
+        thumb.setMaxSize(220, 124);
         thumb.setStyle("-fx-background-color: #334155; -fx-background-radius: 8;");
 
         Image snap = boardSnapshots.get(boardId);
         if (snap != null) {
             ImageView iv = new ImageView(snap);
-            iv.setFitWidth(200);
-            iv.setFitHeight(150);
+            iv.setFitWidth(220);
+            iv.setFitHeight(124);
             iv.setPreserveRatio(true);
             iv.setSmooth(true);
             thumb.getChildren().add(iv);
         } else {
-            Rectangle placeholder = new Rectangle(200, 150);
+            Rectangle placeholder = new Rectangle(220, 124);
             placeholder.setArcWidth(8);
             placeholder.setArcHeight(8);
             placeholder.setFill(Color.web("#334155"));
@@ -611,15 +653,19 @@ public class WhiteboardApp extends Application {
 
         Label name = new Label(boardId);
         name.setWrapText(true);
-        name.setMaxWidth(200);
-        name.setStyle("-fx-text-fill: #e2e8f0; -fx-font-size: 13px; -fx-font-weight: bold;");
+        name.setMaxWidth(220);
+        name.setStyle("-fx-text-fill: #e2e8f0; -fx-font-size: 12px; -fx-font-weight: bold;");
 
         card.getChildren().addAll(thumb, name);
 
-        card.setOnMouseEntered(e -> card.setStyle(
-                "-fx-background-color: #273549; -fx-background-radius: 12; -fx-cursor: hand;" + hoverShadow));
-        card.setOnMouseExited(e -> card.setStyle(
-                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;" + normalShadow));
+        card.setOnMouseEntered(e -> {
+            playBoardSwitcherCardScale(card, 1.05);
+            card.setStyle(baseChrome + "-fx-border-color: #3b82f6; " + hoverShadow);
+        });
+        card.setOnMouseExited(e -> {
+            playBoardSwitcherCardScale(card, 1.0);
+            card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
+        });
         card.setOnMouseClicked(e -> {
             e.consume();
             if (networkClient == null) {
@@ -636,35 +682,62 @@ public class WhiteboardApp extends Application {
     }
 
     private VBox createNewBoardSwitcherCard() {
-        VBox card = new VBox(10);
-        card.setPadding(new Insets(14));
-        card.setAlignment(Pos.CENTER);
-        card.setMinWidth(220);
-        card.setPrefHeight(Region.USE_COMPUTED_SIZE);
-        card.setStyle(
+        VBox card = new VBox(4);
+        card.setMinSize(240, 160);
+        card.setMaxSize(240, 160);
+        card.setPadding(new Insets(4, 10, 4, 10));
+        card.setAlignment(Pos.TOP_CENTER);
+        String normalShadow = "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);";
+        String hoverShadow = "-fx-effect: dropshadow(gaussian, rgba(148,163,184,0.45), 14, 0.25, 0, 2);";
+        String baseChrome =
                 "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;"
-                        + "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);");
+                        + "-fx-border-radius: 12; -fx-border-width: 2; ";
+        card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
         StackPane thumb = new StackPane();
-        thumb.setPrefSize(200, 150);
-        thumb.setMinSize(200, 150);
+        thumb.setPrefSize(220, 124);
+        thumb.setMinSize(220, 124);
+        thumb.setMaxSize(220, 124);
+        thumb.setStyle("-fx-background-color: #334155; -fx-background-radius: 8;");
         Label plus = new Label("+");
         plus.setStyle("-fx-text-fill: #94a3b8; -fx-font-size: 42px; -fx-font-weight: bold;");
         thumb.getChildren().add(plus);
         Label hint = new Label("New board");
-        hint.setStyle("-fx-text-fill: #cbd5e1; -fx-font-size: 13px;");
+        hint.setMaxWidth(220);
+        hint.setStyle("-fx-text-fill: #cbd5e1; -fx-font-size: 12px;");
         card.getChildren().addAll(thumb, hint);
-        card.setOnMouseEntered(e -> card.setStyle(
-                "-fx-background-color: #273549; -fx-background-radius: 12; -fx-cursor: hand;"
-                        + "-fx-effect: dropshadow(gaussian, rgba(148,163,184,0.45), 14, 0.25, 0, 2);"));
-        card.setOnMouseExited(e -> card.setStyle(
-                "-fx-background-color: #1e293b; -fx-background-radius: 12; -fx-cursor: hand;"
-                        + "-fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 10, 0.2, 0, 2);"));
+        card.setOnMouseEntered(e -> {
+            playBoardSwitcherCardScale(card, 1.05);
+            card.setStyle(baseChrome + "-fx-border-color: #3b82f6; " + hoverShadow);
+        });
+        card.setOnMouseExited(e -> {
+            playBoardSwitcherCardScale(card, 1.0);
+            card.setStyle(baseChrome + "-fx-border-color: transparent; " + normalShadow);
+        });
         card.setOnMouseClicked(e -> {
             e.consume();
             hideBoardSwitcher();
             promptNewWorkspaceBoard();
         });
         return card;
+    }
+
+    private static final Object BOARD_SWITCHER_CARD_SCALE_TX_KEY = new Object();
+
+    private static void playBoardSwitcherCardScale(VBox card, double scale) {
+        Object prev = card.getProperties().get(BOARD_SWITCHER_CARD_SCALE_TX_KEY);
+        if (prev instanceof ScaleTransition running) {
+            running.stop();
+        }
+        ScaleTransition st = new ScaleTransition(Duration.millis(150), card);
+        st.setToX(scale);
+        st.setToY(scale);
+        card.getProperties().put(BOARD_SWITCHER_CARD_SCALE_TX_KEY, st);
+        st.setOnFinished(ev -> {
+            if (card.getProperties().get(BOARD_SWITCHER_CARD_SCALE_TX_KEY) == st) {
+                card.getProperties().remove(BOARD_SWITCHER_CARD_SCALE_TX_KEY);
+            }
+        });
+        st.play();
     }
 
     /**
@@ -740,154 +813,194 @@ public class WhiteboardApp extends Application {
     // Toolbar construction
     // =========================================================================
 
-    private BorderPane buildToolbar() {
-        // BorderPane keeps the bottom actions pinned; center ScrollPane only grows between
-        // title and footer (VBox + vgrow made the scroll area claim content height and
-        // pushed Clear / Leave / status off-screen on short windows).
-        BorderPane sidebar = new BorderPane();
-        sidebar.setPrefWidth(TOOLBAR_WIDTH);
-        sidebar.setMinWidth(TOOLBAR_WIDTH);
-        sidebar.setMaxWidth(TOOLBAR_WIDTH);
-        sidebar.getStyleClass().add("sidebar");
+    /**
+     * Left-center collapsible tool drawer: {@link HBox} shell + inner {@link VBox} panel (initialises
+     * {@link #colorPicker}, {@link #strokeSlider}). The whole {@link HBox} translates so StackPane alignment
+     * stays stable (translating only the inner {@link VBox} skewed bounds and left the chevron stranded).
+     */
+    private HBox buildToolDrawer() {
+        VBox toolsPanel = new VBox(8);
+        toolsPanel.getStyleClass().addAll("hud-panel", "tools-island");
+        toolsPanel.setAlignment(Pos.CENTER);
+        toolsPanel.setPickOnBounds(false);
+        toolsPanel.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
 
-        // App title
-        Label title = new Label("DistriSync");
-        title.setStyle(
-            "-fx-text-fill: white; -fx-font-size: 15px; -fx-font-weight: bold; -fx-padding: 0 0 4 0;");
-        title.setMaxWidth(Double.MAX_VALUE);
-        title.setAlignment(Pos.CENTER);
+        canvasToolGroup = new ToggleGroup();
+        canvasToolLine   = toolToggle("/", "Line", "L", canvasToolGroup, true);
+        canvasToolCircle = toolToggle("◯", "Circle", "O", canvasToolGroup, false);
+        canvasToolPen    = toolToggle("✎", "Pen", "P", canvasToolGroup, false);
+        canvasToolEraser = toolToggle("▧", "Eraser", "E", canvasToolGroup, false);
+        canvasToolText   = toolToggle("T", "Text", "T", canvasToolGroup, false);
 
-        // Tool toggle group — exactly one active at a time
-        ToggleGroup toolGroup = new ToggleGroup();
-        ToggleButton lineBtn   = toolToggle("✏  Line",   toolGroup, true);
-        ToggleButton circleBtn = toolToggle("◯  Circle", toolGroup, false);
-        ToggleButton penBtn    = toolToggle("🖊  Pen",    toolGroup, false);
-        ToggleButton eraserBtn = toolToggle("◻  Eraser", toolGroup, false);
-        ToggleButton textBtn   = toolToggle("T  Text",   toolGroup, false);
+        canvasToolLine.setOnAction(e   -> activateCanvasTool(Tool.LINE, canvasToolLine));
+        canvasToolCircle.setOnAction(e -> activateCanvasTool(Tool.CIRCLE, canvasToolCircle));
+        canvasToolPen.setOnAction(e    -> activateCanvasTool(Tool.FREEHAND, canvasToolPen));
+        canvasToolEraser.setOnAction(e -> activateCanvasTool(Tool.ERASER, canvasToolEraser));
+        canvasToolText.setOnAction(e   -> activateCanvasTool(Tool.TEXT, canvasToolText));
 
-        lineBtn.setOnAction(e   -> { activeTool = Tool.LINE;     dismissActiveTextField(); });
-        circleBtn.setOnAction(e -> { activeTool = Tool.CIRCLE;   dismissActiveTextField(); });
-        penBtn.setOnAction(e    -> { activeTool = Tool.FREEHAND; dismissActiveTextField(); });
-        eraserBtn.setOnAction(e -> { activeTool = Tool.ERASER;   dismissActiveTextField(); });
-        textBtn.setOnAction(e   -> { activeTool = Tool.TEXT;     dismissActiveTextField(); });
-
-        // ── Cursor affordance: update mouse cursor when the active tool changes ─
-        toolGroup.selectedToggleProperty().addListener((obs, oldToggle, newToggle) -> {
+        canvasToolGroup.selectedToggleProperty().addListener((obs, oldToggle, newToggle) -> {
+            applyToolToggleStyleClasses(canvasToolGroup);
             if (newToggle == null) return;
-            if (newToggle == eraserBtn) {
-                // Eraser: hide the OS cursor; the square eraserCursor node takes its place
+            if (newToggle == canvasToolEraser) {
                 if (cursorPane      != null) cursorPane.setCursor(Cursor.NONE);
                 if (transientCanvas != null) transientCanvas.setCursor(Cursor.NONE);
             } else {
-                // Any other tool: hide the eraser square and restore the OS cursor
                 if (eraserCursor    != null) eraserCursor.setVisible(false);
-                Cursor cursor = (newToggle == textBtn) ? Cursor.TEXT : Cursor.CROSSHAIR;
+                Cursor cursor = (newToggle == canvasToolText) ? Cursor.TEXT : Cursor.CROSSHAIR;
                 if (cursorPane      != null) cursorPane.setCursor(cursor);
                 if (transientCanvas != null) transientCanvas.setCursor(cursor);
             }
         });
-        // Apply the initial cursor for the default tool (LINE → CROSSHAIR)
+        applyToolToggleStyleClasses(canvasToolGroup);
         if (cursorPane      != null) cursorPane.setCursor(Cursor.CROSSHAIR);
         if (transientCanvas != null) transientCanvas.setCursor(Cursor.CROSSHAIR);
 
-        // ── TOOLS section ────────────────────────────────────────────────────
-        VBox toolsSection = new VBox(10,
-            sectionLabel("TOOLS"),
-            lineBtn, circleBtn, penBtn, eraserBtn, textBtn
-        );
+        VBox toolColumn = new VBox(8, canvasToolLine, canvasToolCircle, canvasToolPen, canvasToolEraser, canvasToolText);
+        toolColumn.setFillWidth(true);
 
-        // ── COLOR section ────────────────────────────────────────────────────
-        colorPicker = new ColorPicker(Color.web(ACCENT));
-        colorPicker.setMaxWidth(Double.MAX_VALUE);
-        colorPicker.setStyle("-fx-cursor: hand;");
-
-        VBox colorSection = new VBox(10,
-            sectionLabel("COLOR"),
-            colorPicker
-        );
-
-        // ── STROKE WIDTH section ──────────────────────────────────────────────
-        strokeSlider = new Slider(1, 20, 2);
-        strokeSlider.setShowTickLabels(true);
-        strokeSlider.setMajorTickUnit(5);
-        strokeSlider.setMaxWidth(Double.MAX_VALUE);
-
-        VBox strokeSection = new VBox(10,
-            sectionLabel("STROKE WIDTH"),
-            strokeSlider
-        );
-        colorSection.setPadding(new Insets(0, 0, 10, 0));
-        strokeSection.setPadding(new Insets(0, 0, 10, 0));
-
-        VBox topTools = new VBox(25, toolsSection, colorSection, strokeSection);
-
-        // ── Action buttons — bottom group with spacer above ───────────────────
-        Button undoBtn = new Button("⤺  Undo Last");
-        undoBtn.setMaxWidth(Double.MAX_VALUE);
-        undoBtn.getStyleClass().add("sidebar-secondary-button");
+        Button undoBtn = new Button("⤺");
+        undoBtn.getStyleClass().add("tool-btn");
+        undoBtn.setFocusTraversable(false);
+        undoBtn.setMnemonicParsing(false);
         undoBtn.setOnAction(e -> undoLastShape());
-        undoBtn.setTooltip(new Tooltip("Undo last stroke (Ctrl+Z)"));
+        Tooltip.install(undoBtn, createTooltip("Undo", "Ctrl+Z"));
 
-        Button clearBtn = new Button("Clear Board");
-        clearBtn.setMaxWidth(Double.MAX_VALUE);
-        clearBtn.getStyleClass().add("ghost-danger-button");
+        Button clearBtn = new Button("⌧");
+        clearBtn.getStyleClass().add("tool-btn");
+        clearBtn.setFocusTraversable(false);
+        clearBtn.setMnemonicParsing(false);
         clearBtn.setOnAction(e -> clearBoard());
-        clearBtn.setTooltip(new Tooltip("Remove all shapes on this board for everyone"));
+        Tooltip.install(clearBtn, createTooltip("Clear board", ""));
 
+        HBox secondaryRow = new HBox(6, undoBtn, clearBtn);
+        secondaryRow.setAlignment(Pos.CENTER);
+
+        colorPicker = new ColorPicker(Color.web(ACCENT));
+        colorPicker.setMaxWidth(30);
+        colorPicker.getStyleClass().add("tools-island-color-picker");
+        colorPicker.setStyle("-fx-background-radius: 50%; -fx-cursor: hand;");
+
+        strokeSlider = new Slider(1, 20, 2);
+        strokeSlider.setShowTickLabels(false);
+        strokeSlider.setMaxWidth(Double.MAX_VALUE);
+        Tooltip.install(colorPicker, createTooltip("Color", ""));
+        Tooltip.install(strokeSlider, createTooltip("Stroke Width", ""));
+
+        Separator toolsColorSep = new Separator();
+        toolsColorSep.setMaxWidth(Double.MAX_VALUE);
+
+        toolsPanel.getChildren().addAll(toolColumn, secondaryRow, toolsColorSep, colorPicker, strokeSlider);
+
+        Button toolDrawerToggleBtn = new Button("<");
+        toolDrawerToggleBtn.getStyleClass().add("tools-drawer-toggle");
+        toolDrawerToggleBtn.setFocusTraversable(false);
+        toolDrawerToggleBtn.setMnemonicParsing(false);
+        Tooltip.install(toolDrawerToggleBtn, createTooltip("Hide tools", ""));
+
+        HBox toolDrawer = new HBox(0, toolsPanel, toolDrawerToggleBtn);
+        toolDrawer.setAlignment(Pos.CENTER_LEFT);
+        toolDrawer.setPickOnBounds(false);
+        toolDrawer.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+
+        // Slide the whole row: translating only the inner VBox skews HBox boundsInParent and
+        // StackPane CENTER_LEFT alignment leaves the chevron visually "behind" on the canvas.
+        toolDrawerToggleBtn.setOnAction(e -> {
+            if (toolsDrawerSlideTransition != null) {
+                toolsDrawerSlideTransition.stop();
+            }
+            toolsPanel.setTranslateX(0);
+            double w = toolsPanel.getLayoutBounds().getWidth();
+            if (w <= 1) {
+                w = toolsPanel.prefWidth(-1);
+            }
+            TranslateTransition tt = new TranslateTransition(Duration.millis(250), toolDrawer);
+            toolsDrawerSlideTransition = tt;
+            toolDrawerToggleBtn.setDisable(true);
+            toolDrawerToggleBtn.setText(toolsDrawerToggleModel.chevronAtAnimationStart());
+            tt.setToX(toolsDrawerToggleModel.animationTargetTranslateX(w));
+            tt.setOnFinished(ev -> {
+                toolDrawerToggleBtn.setDisable(false);
+                toolsDrawerToggleModel.commitAfterToggleAnimation();
+                if (toolsDrawerToggleModel.isToolsOpen()) {
+                    Tooltip.install(toolDrawerToggleBtn, createTooltip("Hide tools", ""));
+                } else {
+                    Tooltip.install(toolDrawerToggleBtn, createTooltip("Show tools", ""));
+                }
+            });
+            tt.play();
+        });
+
+        return toolDrawer;
+    }
+
+    /** HUD tool toggles: {@code tool-btn-active} on the selected tool, {@code tool-btn} on all. */
+    private static void applyToolToggleStyleClasses(ToggleGroup group) {
+        Toggle selected = group.getSelectedToggle();
+        for (Toggle t : group.getToggles()) {
+            if (t instanceof ToggleButton tb) {
+                tb.getStyleClass().remove("tool-btn-active");
+                if (t == selected) {
+                    tb.getStyleClass().add("tool-btn-active");
+                }
+            }
+        }
+    }
+
+    /** Top-right floating island: leave room + connection status (initialises {@link #statusLabel}). */
+    private HBox buildTopRightHud() {
         Button leaveRoomBtn = new Button("Leave Room");
-        leaveRoomBtn.setMaxWidth(Double.MAX_VALUE);
         leaveRoomBtn.getStyleClass().add("ghost-danger-button");
+        leaveRoomBtn.setFocusTraversable(false);
+        leaveRoomBtn.setMnemonicParsing(false);
         leaveRoomBtn.setOnAction(e -> leaveCanvasRoom());
         leaveRoomBtn.setTooltip(new Tooltip("Return to the lobby"));
 
-        VBox actionButtons = new VBox(10, undoBtn, clearBtn, leaveRoomBtn);
-
         statusLabel = new Label("⬤ Offline");
         statusLabel.setStyle("-fx-text-fill: " + RED + "; -fx-font-size: 12px;");
-        statusLabel.setMaxWidth(Double.MAX_VALUE);
-        statusLabel.setAlignment(Pos.CENTER);
-        VBox.setMargin(statusLabel, new Insets(10, 0, 0, 0));
 
-        VBox bottomGroup = new VBox(actionButtons, statusLabel);
-
-        topTools.setMinSize(0, 0);
-        VBox scrollBody = new VBox(25, topTools);
-        scrollBody.setMaxWidth(Double.MAX_VALUE);
-        scrollBody.setMinSize(0, 0);
-
-        ScrollPane toolsScroll = new ScrollPane(scrollBody);
-        toolsScroll.setFitToWidth(true);
-        toolsScroll.setMinSize(0, 0);
-        toolsScroll.setMinViewportHeight(0);
-        toolsScroll.setPrefViewportHeight(120);
-        toolsScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
-        toolsScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
-        toolsScroll.setPannable(false);
-        toolsScroll.getStyleClass().add("sidebar-scroll");
-
-        sidebar.setTop(title);
-        BorderPane.setAlignment(title, Pos.TOP_CENTER);
-        BorderPane.setMargin(title, new Insets(0, 0, 12, 0));
-        sidebar.setCenter(toolsScroll);
-        sidebar.setBottom(bottomGroup);
-        BorderPane.setMargin(bottomGroup, new Insets(8, 0, 0, 0));
-
-        return sidebar;
+        HBox row = new HBox(12, leaveRoomBtn, statusLabel);
+        row.setAlignment(Pos.CENTER_LEFT);
+        row.getStyleClass().add("hud-panel");
+        row.setPickOnBounds(false);
+        row.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        return row;
     }
 
-    private ToggleButton toolToggle(String text, ToggleGroup group, boolean selected) {
-        ToggleButton btn = new ToggleButton(text);
+    private ToggleButton toolToggle(String icon, String name, String shortcut, ToggleGroup group, boolean selected) {
+        ToggleButton btn = new ToggleButton(icon);
         btn.setToggleGroup(group);
         btn.setSelected(selected);
         btn.setMaxWidth(Double.MAX_VALUE);
-        btn.getStyleClass().add("tool-button");
+        btn.getStyleClass().add("tool-btn");
+        btn.setFocusTraversable(false);
+        btn.setMnemonicParsing(false);
+        Tooltip.install(btn, createTooltip(name, shortcut));
         return btn;
     }
 
-    private Label sectionLabel(String text) {
-        Label l = new Label(text);
-        l.getStyleClass().add("section-header");
-        return l;
+    /**
+     * Glass-styled tooltip text "{@code Name (shortcut)}" with snappy show/hide delays.
+     * When {@code shortcut} is blank, only {@code name} is shown.
+     */
+    private Tooltip createTooltip(String name, String shortcut) {
+        Tooltip tooltip = new Tooltip();
+        if (shortcut == null || shortcut.isBlank()) {
+            tooltip.setText(name);
+        } else {
+            tooltip.setText(name + " (" + shortcut + ")");
+        }
+        tooltip.setShowDelay(Duration.millis(200));
+        tooltip.setHideDelay(Duration.millis(100));
+        return tooltip;
+    }
+
+    private void activateCanvasTool(Tool tool, ToggleButton toggle) {
+        if (toggle == null || canvasToolGroup == null) {
+            return;
+        }
+        dismissActiveTextField();
+        activeTool = tool;
+        canvasToolGroup.selectToggle(toggle);
     }
 
     // =========================================================================
@@ -1090,6 +1203,151 @@ public class WhiteboardApp extends Application {
             primaryStage.setTitle("DistriSync – Lobby");
         }
         setStatus("⬤ In lobby", FG_MUTED);
+    }
+
+    // =========================================================================
+    // Push-to-talk (canvas scene)
+    // =========================================================================
+
+    /**
+     * Space activates PTT except while typing in a {@link TextInputControl}, so
+     * whiteboard text fields keep normal space handling.
+     */
+    private void attachPttKeyEventFilters(Scene scene) {
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
+            if (e.getCode() != KeyCode.SPACE) {
+                return;
+            }
+            if (e.getTarget() instanceof TextInputControl) {
+                return;
+            }
+            if (networkClient == null) {
+                return;
+            }
+            AudioEngine audio = networkClient.getAudioEngine();
+            if (audio.isRecording()) {
+                return;
+            }
+            try {
+                audio.startRecording();
+            } catch (Exception ex) {
+                log.debug("PTT startRecording: {}", ex.getMessage());
+                return;
+            }
+            applyPttSelfTransmittingVisual();
+            playPttScalePulse(1.05);
+            if (pttRemoteSilenceTimer != null) {
+                pttRemoteSilenceTimer.stop();
+            }
+            e.consume();
+        });
+
+        scene.addEventFilter(KeyEvent.KEY_RELEASED, e -> {
+            if (e.getCode() != KeyCode.SPACE) {
+                return;
+            }
+            if (networkClient == null) {
+                return;
+            }
+            AudioEngine audio = networkClient.getAudioEngine();
+            boolean recording = audio.isRecording();
+            if (e.getTarget() instanceof TextInputControl && !recording) {
+                return;
+            }
+            audio.stopRecording();
+            applyPttDefaultVisual();
+            playPttScalePulse(1.0);
+            e.consume();
+        });
+    }
+
+    private void playPttScalePulse(double toScale) {
+        if (pttIndicatorLabel == null) {
+            return;
+        }
+        if (pttScaleTransition != null) {
+            pttScaleTransition.stop();
+        }
+        double from = pttIndicatorLabel.getScaleX();
+        pttScaleTransition = new ScaleTransition(Duration.millis(100), pttIndicatorLabel);
+        pttScaleTransition.setFromX(from);
+        pttScaleTransition.setFromY(pttIndicatorLabel.getScaleY());
+        pttScaleTransition.setToX(toScale);
+        pttScaleTransition.setToY(toScale);
+        pttScaleTransition.play();
+    }
+
+    private void applyPttSelfTransmittingVisual() {
+        if (pttIndicatorLabel == null) {
+            return;
+        }
+        pttIndicatorLabel.setText(PTT_TRANSMITTING_TEXT);
+        pttIndicatorLabel.getStyleClass().remove("ptt-active-other");
+        if (!pttIndicatorLabel.getStyleClass().contains("ptt-active-self")) {
+            pttIndicatorLabel.getStyleClass().add("ptt-active-self");
+        }
+        if (!pttIndicatorLabel.getStyleClass().contains("ptt-indicator")) {
+            pttIndicatorLabel.getStyleClass().add(0, "ptt-indicator");
+        }
+    }
+
+    private void applyPttDefaultVisual() {
+        if (pttIndicatorLabel == null) {
+            return;
+        }
+        pttIndicatorLabel.setText(PTT_DEFAULT_TEXT);
+        pttIndicatorLabel.getStyleClass().removeAll("ptt-active-self", "ptt-active-other");
+        if (!pttIndicatorLabel.getStyleClass().contains("ptt-indicator")) {
+            pttIndicatorLabel.getStyleClass().add("ptt-indicator");
+        }
+    }
+
+    private void revertPttIndicatorAfterRemoteGap() {
+        if (pttIndicatorLabel == null || networkClient == null) {
+            return;
+        }
+        if (networkClient.getAudioEngine().isRecording()) {
+            return;
+        }
+        applyPttDefaultVisual();
+        playPttScalePulse(1.0);
+    }
+
+    private void onRemoteUserSpeaking(String speakerId) {
+        if (pttIndicatorLabel == null || networkClient == null) {
+            return;
+        }
+        AudioEngine audio = networkClient.getAudioEngine();
+        if (audio.isRecording()) {
+            return;
+        }
+        String token = networkClient.getUdpToken();
+        if (speakerId != null && token != null && !token.isEmpty() && speakerId.equals(token)) {
+            return;
+        }
+        String who = formatRemoteSpeakerLabel(speakerId);
+        String subject = who.equalsIgnoreCase("Someone") ? "USER" : who.toUpperCase();
+        pttIndicatorLabel.setText("[ 🔊 ] " + subject + " SPEAKING...");
+        pttIndicatorLabel.getStyleClass().remove("ptt-active-self");
+        if (!pttIndicatorLabel.getStyleClass().contains("ptt-active-other")) {
+            pttIndicatorLabel.getStyleClass().add("ptt-active-other");
+        }
+        if (!pttIndicatorLabel.getStyleClass().contains("ptt-indicator")) {
+            pttIndicatorLabel.getStyleClass().add(0, "ptt-indicator");
+        }
+        playPttScalePulse(1.05);
+        if (pttRemoteSilenceTimer != null) {
+            pttRemoteSilenceTimer.stop();
+            pttRemoteSilenceTimer.playFromStart();
+        }
+    }
+
+    private static String formatRemoteSpeakerLabel(String speakerId) {
+        if (speakerId == null || speakerId.isBlank()) {
+            return "Someone";
+        }
+        String s = speakerId.strip();
+        return s.length() > 24 ? s.substring(0, 21) + "…" : s;
     }
 
     // =========================================================================
@@ -1628,6 +1886,8 @@ public class WhiteboardApp extends Application {
         networkPort = port;
 
         networkClient = new NetworkClient(host, port, authorName, clientId);
+        networkClient.getAudioEngine().setUserSpeakingListener(speakerId ->
+                Platform.runLater(() -> onRemoteUserSpeaking(speakerId)));
         networkClient.addLobbyListener(rooms ->
                 Platform.runLater(() -> refreshLobbyRooms(rooms)));
 
@@ -2125,7 +2385,7 @@ public class WhiteboardApp extends Application {
      * updates in real time as the user drags the slider.
      *
      * <p>Must be called after both {@code cursorPane} and {@code strokeSlider}
-     * are initialised (i.e. after {@link #buildToolbar()} and the canvas stack
+     * are initialised (i.e. after {@link #buildToolDrawer()} and the canvas stack
      * are set up in {@link #start}).
      */
     private void setupEraserCursor() {

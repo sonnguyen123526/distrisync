@@ -12,18 +12,26 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
+import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.nio.charset.CharsetEncoder;
+import java.nio.charset.CoderResult;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
@@ -67,8 +75,36 @@ public final class NioServer implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(NioServer.class);
 
+    /** Selector attachment marking the shared UDP {@link DatagramChannel} key (not a {@link ClientSession}). */
+    private static final Object UDP_CHANNEL_ATTACHMENT = new Object();
+
+    /** Fixed prefix size for UDP token / {@link ClientSession#clientId} relay header. */
+    private static final int UDP_IDENTITY_BYTES = 36;
+
     private final int port;
     private final RoomManager roomManager;
+
+    /**
+     * Maps {@link ClientSession#udpToken} to the owning session for UDP registration and audio relay.
+     * {@link ConcurrentHashMap} provides lock-free reads on the selector thread during UDP fan-out.
+     */
+    private final ConcurrentHashMap<String, ClientSession> udpTokenToSession = new ConcurrentHashMap<>();
+
+    /**
+     * Direct buffer for UDP receive / in-place relay header rewrite — avoids JVM heap copies on the
+     * I/O path (selector thread only).
+     */
+    private final ByteBuffer udpBuffer = ByteBuffer.allocateDirect(1024);
+
+    /** Scratch for the 36-byte UDP token prefix; avoids per-datagram {@code byte[]} allocation. */
+    private final byte[] udpTokenScratch = new byte[UDP_IDENTITY_BYTES];
+
+    /**
+     * Reused on the selector thread to write the 36-byte client-id prefix without {@code String#getBytes}.
+     */
+    private final CharsetEncoder udpClientIdEncoder = StandardCharsets.UTF_8.newEncoder()
+            .onMalformedInput(CodingErrorAction.REPLACE)
+            .onUnmappableCharacter(CodingErrorAction.REPLACE);
 
     /**
      * Completes with the actual TCP port the server bound to.  Useful when
@@ -119,6 +155,7 @@ public final class NioServer implements Runnable {
         log.info("NioServer starting on port {}", port);
 
         try (ServerSocketChannel serverChannel = ServerSocketChannel.open();
+             DatagramChannel datagramChannel = DatagramChannel.open();
              Selector selector = Selector.open()) {
 
             this.selector = selector;
@@ -134,9 +171,14 @@ public final class NioServer implements Runnable {
             serverChannel.register(selector, SelectionKey.OP_ACCEPT);
 
             int actualPort = ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
+
+            datagramChannel.configureBlocking(false);
+            datagramChannel.bind(new InetSocketAddress(actualPort));
+            datagramChannel.register(selector, SelectionKey.OP_READ, UDP_CHANNEL_ATTACHMENT);
+
             boundPortFuture.complete(actualPort);
 
-            log.info("NioServer listening — port={} minConcurrentClients=4", actualPort);
+            log.info("NioServer listening — tcpUdpPort={} (TCP + UDP) minConcurrentClients=4", actualPort);
 
             while (!stopped && !Thread.currentThread().isInterrupted()) {
                 selector.select();
@@ -171,13 +213,21 @@ public final class NioServer implements Runnable {
 
         if (key.isAcceptable()) {
             handleAccept((ServerSocketChannel) key.channel(), selector);
-        } else {
+            return;
+        }
+
+        if (key.attachment() == UDP_CHANNEL_ATTACHMENT) {
             if (key.isReadable()) {
-                handleRead(key, selector);
+                handleUdpRead(key);
             }
-            if (key.isValid() && key.isWritable()) {
-                handleWrite(key);
-            }
+            return;
+        }
+
+        if (key.isReadable()) {
+            handleRead(key, selector);
+        }
+        if (key.isValid() && key.isWritable()) {
+            handleWrite(key);
         }
     }
 
@@ -303,9 +353,14 @@ public final class NioServer implements Runnable {
                 }
                 try {
                     RoomContext room = roomManager.assignClientToRoom(senderKey, rid, session.roomId);
+                    revokeUdpAdmission(session);
+                    String udpToken = UUID.randomUUID().toString();
+                    session.udpToken = udpToken;
+                    udpTokenToSession.put(udpToken, session);
                     session.roomId = rid;
                     session.currentBoardId = jp.initialBoardId();
                     sendSnapshot(session, senderKey, room);
+                    sendUdpAdmission(session, senderKey, udpToken);
                     broadcastBoardList(room);
                     log.info("JOIN_ROOM session={} roomId='{}' boardId='{}'",
                             session.sessionId, rid, session.currentBoardId);
@@ -324,6 +379,7 @@ public final class NioServer implements Runnable {
                 }
                 String cur = session.roomId;
                 roomManager.returnClientToLobby(senderKey, cur);
+                revokeUdpAdmission(session);
                 session.roomId = "";
                 session.currentBoardId = "";
                 log.info("LEAVE_ROOM session={} → lobby", session.sessionId);
@@ -520,6 +576,123 @@ public final class NioServer implements Runnable {
      * Encodes the room's current canvas state as a {@code SNAPSHOT} frame and
      * enqueues it for delivery to the newly joined session.
      */
+    private void revokeUdpAdmission(ClientSession session) {
+        String tok = session.udpToken;
+        if (tok != null && !tok.isBlank()) {
+            udpTokenToSession.remove(tok, session);
+        }
+        session.udpToken = "";
+        session.udpEndpoint = null;
+    }
+
+    private void sendUdpAdmission(ClientSession session, SelectionKey key, String udpToken) {
+        ByteBuffer frame = MessageCodec.encodeUdpAdmission(udpToken);
+        session.enqueue(frame);
+        if (!flushWriteQueue(session, key)) {
+            log.error("UDP_ADMISSION flush failed for session={} — closing connection", session.sessionId);
+            closeKey(key);
+        }
+    }
+
+    private void handleUdpRead(SelectionKey key) {
+        DatagramChannel dc = (DatagramChannel) key.channel();
+        udpBuffer.clear();
+        final SocketAddress senderAddr;
+        try {
+            senderAddr = dc.receive(udpBuffer);
+        } catch (IOException e) {
+            log.warn("UDP receive I/O error: {}", e.getMessage());
+            return;
+        }
+        if (senderAddr == null) {
+            return;
+        }
+        if (!(senderAddr instanceof InetSocketAddress sender)) {
+            return;
+        }
+        udpBuffer.flip();
+        int len = udpBuffer.remaining();
+        if (len < UDP_IDENTITY_BYTES) {
+            return;
+        }
+
+        udpBuffer.get(udpTokenScratch);
+        String token = new String(udpTokenScratch, StandardCharsets.UTF_8);
+
+        if (len == UDP_IDENTITY_BYTES) {
+            ClientSession session = udpTokenToSession.get(token);
+            if (session == null) {
+                return;
+            }
+            session.udpEndpoint = sender;
+            log.debug("UDP endpoint registered  session={} remote={}", session.sessionId, sender);
+            return;
+        }
+
+        ClientSession speaker = udpTokenToSession.get(token);
+        if (speaker == null) {
+            return;
+        }
+        InetSocketAddress registered = speaker.udpEndpoint;
+        if (registered == null || !registered.equals(sender)) {
+            return;
+        }
+        if (speaker.roomId == null || speaker.roomId.isBlank()) {
+            return;
+        }
+        RoomContext room = roomManager.getRoom(speaker.roomId);
+        if (room == null) {
+            return;
+        }
+
+        udpBuffer.position(0);
+        writeClientIdPrefix36(udpBuffer, speaker.clientId);
+        udpBuffer.limit(len);
+
+        for (SelectionKey peerKey : room.getActiveKeys()) {
+            if (!peerKey.isValid() || !(peerKey.attachment() instanceof ClientSession peer)) {
+                continue;
+            }
+            if (peer == speaker) {
+                continue;
+            }
+            InetSocketAddress dest = peer.udpEndpoint;
+            if (dest == null) {
+                continue;
+            }
+            try {
+                udpBuffer.rewind();
+                dc.send(udpBuffer, dest);
+            } catch (IOException e) {
+                log.debug("UDP relay send to {} failed: {}", dest, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Writes exactly {@value #UDP_IDENTITY_BYTES} bytes of UTF-8 for {@code clientId}, zero-padded.
+     * Uses {@link #udpClientIdEncoder} so the hot path does not allocate a {@code CharsetEncoder} or {@code byte[]}.
+     */
+    private void writeClientIdPrefix36(ByteBuffer dst, String clientId) {
+        int start = dst.position();
+        int oldLimit = dst.limit();
+        CharBuffer in = CharBuffer.wrap(clientId != null ? clientId : "");
+        try {
+            dst.limit(start + UDP_IDENTITY_BYTES);
+            udpClientIdEncoder.reset();
+            udpClientIdEncoder.encode(in, dst, true);
+            CoderResult flush = udpClientIdEncoder.flush(dst);
+            if (flush.isOverflow()) {
+                dst.position(start + UDP_IDENTITY_BYTES);
+            }
+        } finally {
+            dst.limit(oldLimit);
+        }
+        while (dst.position() < start + UDP_IDENTITY_BYTES) {
+            dst.put((byte) 0);
+        }
+    }
+
     private void sendSnapshot(ClientSession session, SelectionKey key, RoomContext room) {
         List<Shape> shapes = room.getBoard(session.currentBoardId).snapshot();
         String payload = ShapeCodec.encodeSnapshot(shapes);
@@ -708,6 +881,7 @@ public final class NioServer implements Runnable {
         Object attachment = key.attachment();
 
         if (attachment instanceof ClientSession s) {
+            revokeUdpAdmission(s);
             if (roomManager.isInLobby(key)) {
                 roomManager.removeFromLobby(key);
             } else if (!s.roomId.isBlank()) {
@@ -740,6 +914,14 @@ public final class NioServer implements Runnable {
     /** The {@link RoomManager} backing this server instance. */
     public RoomManager getRoomManager() {
         return roomManager;
+    }
+
+    /**
+     * The live UDP token → session registry (used by {@link #handleUdpRead}).
+     * Package-private for tests in {@code com.distrisync.server}.
+     */
+    ConcurrentHashMap<String, ClientSession> udpTokenRegistryForTests() {
+        return udpTokenToSession;
     }
 
     /**

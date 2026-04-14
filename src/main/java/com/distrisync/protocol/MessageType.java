@@ -27,6 +27,7 @@ import java.util.Map;
  * 0x0E        LEAVE_ROOM    – client→server: return to lobby (empty payload)
  * 0x0F        SWITCH_BOARD      – client→server: JSON string target boardId (e.g. "Board-1")
  * 0x10        BOARD_LIST_UPDATE – server→client: JSON array of board id strings active in the room
+ * 0x11        UDP_ADMISSION     – server→client: JSON object { udpToken } for joining the UDP audio data plane
  * </pre>
  */
 public enum MessageType {
@@ -46,7 +47,8 @@ public enum MessageType {
     JOIN_ROOM   ((byte) 0x0D),
     LEAVE_ROOM  ((byte) 0x0E),
     SWITCH_BOARD((byte) 0x0F),
-    BOARD_LIST_UPDATE((byte) 0x10);
+    BOARD_LIST_UPDATE((byte) 0x10),
+    UDP_ADMISSION    ((byte) 0x11);
 
     private final byte wireCode;
 
