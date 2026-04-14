@@ -141,6 +141,11 @@ public final class NetworkClient implements AutoCloseable {
     private final CopyOnWriteArrayList<LobbyUpdateListener> lobbyListeners =
             new CopyOnWriteArrayList<>();
 
+    /** Opaque UDP relay token from the latest {@link MessageType#UDP_ADMISSION}; empty until admitted. */
+    private volatile String udpToken = "";
+
+    private final AudioEngine audioEngine = new AudioEngine();
+
     /**
      * Outgoing MUTATION frames awaiting dispatch.  Produced by any thread via
      * {@link #sendMutation}; consumed exclusively by the write thread.
@@ -258,6 +263,7 @@ public final class NetworkClient implements AutoCloseable {
             sendHandshake();
             startWriteThread();
             startReadThread();
+            audioEngine.startReceiveDaemon();
         } catch (IOException e) {
             running.set(false);
             SocketChannel ch = channel;
@@ -423,6 +429,23 @@ public final class NetworkClient implements AutoCloseable {
         return running.get();
     }
 
+    /**
+     * Push-to-talk audio engine (mic capture + UDP playback). Configure speaking
+     * highlights via {@link AudioEngine#setUserSpeakingListener(UserSpeakingListener)}.
+     */
+    public AudioEngine getAudioEngine() {
+        return audioEngine;
+    }
+
+    /**
+     * Last opaque UDP token from {@link MessageType#UDP_ADMISSION}; empty in the lobby
+     * or before the server issues a token.
+     */
+    public String getUdpToken() {
+        String t = udpToken;
+        return t != null ? t : "";
+    }
+
     /** Adds {@code frame} to the write queue and unparks the write thread. */
     private void enqueueFrame(ByteBuffer frame) {
         writeQueue.offer(frame);
@@ -469,6 +492,8 @@ public final class NetworkClient implements AutoCloseable {
     @Override
     public void close() {
         running.set(false);
+
+        audioEngine.close();
 
         SocketChannel ch = channel;
         if (ch != null) {
@@ -999,6 +1024,16 @@ public final class NetworkClient implements AutoCloseable {
                     notifyWorkspaceListeners();
                 } catch (Exception e) {
                     log.debug("Malformed BOARD_LIST_UPDATE ignored: {}", e.getMessage());
+                }
+            }
+            case UDP_ADMISSION -> {
+                try {
+                    String token = MessageCodec.decodeUdpAdmission(msg);
+                    udpToken = token;
+                    audioEngine.onUdpAdmission(host, port, token);
+                    log.debug("UDP_ADMISSION stored; NAT punch sent to {}:{}", host, port);
+                } catch (Exception e) {
+                    log.warn("UDP_ADMISSION handling failed: {}", e.getMessage(), e);
                 }
             }
             default -> log.warn("Ignoring unexpected inbound message type={} — check client/server versions",

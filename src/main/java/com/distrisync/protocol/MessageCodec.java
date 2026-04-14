@@ -457,6 +457,35 @@ public final class MessageCodec {
     }
 
     // -------------------------------------------------------------------------
+    // UDP_ADMISSION (server → client)
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON body for {@link MessageType#UDP_ADMISSION}: opaque token the client sends on the UDP
+     * data plane for registration and audio relay.
+     */
+    public record UdpAdmissionPayload(String udpToken) {}
+
+    public static ByteBuffer encodeUdpAdmission(String udpToken) {
+        if (udpToken == null || udpToken.isBlank()) {
+            throw new IllegalArgumentException("udpToken must not be null or blank");
+        }
+        return encodeObject(MessageType.UDP_ADMISSION, new UdpAdmissionPayload(udpToken));
+    }
+
+    public static String decodeUdpAdmission(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.UDP_ADMISSION) {
+            throw new IllegalArgumentException("expected UDP_ADMISSION, got " + msg.type());
+        }
+        UdpAdmissionPayload p = GSON.fromJson(msg.payload(), UdpAdmissionPayload.class);
+        if (p == null || p.udpToken() == null || p.udpToken().isBlank()) {
+            throw new IllegalArgumentException("UDP_ADMISSION missing udpToken");
+        }
+        return p.udpToken();
+    }
+
+    // -------------------------------------------------------------------------
     // CLEAR_USER_SHAPES helpers
     // -------------------------------------------------------------------------
 

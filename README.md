@@ -51,9 +51,13 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Reconnect with Back-off** — `NetworkClient` reconnects automatically after EOF or I/O errors using a synchronised `reconnect()` cycle that re-executes the full `HANDSHAKE` → `SNAPSHOT` flow to restore canvas state.
 
-- **Lobby Discovery & Room Management (`LOBBY_STATE` / `JOIN_ROOM` / `LEAVE_ROOM`)** — clients connect to a lobby state and receive periodic `LOBBY_STATE` broadcasts listing all active rooms with live user counts. `JOIN_ROOM` transitions a client from lobby into a specific room's canvas; `LEAVE_ROOM` returns to the lobby. The server maintains a single global lobby session for discovery and scoped room sessions for drawing, allowing efficient multi-room deployments with isolated state per room.
+- **Lobby Discovery & Room Management (`LOBBY_STATE` / `JOIN_ROOM` / `LEAVE_ROOM`)** — clients connect to a lobby and receive periodic `LOBBY_STATE` broadcasts listing all active rooms with live user counts. `JOIN_ROOM` transitions a client from lobby into a specific room's canvas (accepting a `roomId` and optional `initialBoardId`); `LEAVE_ROOM` returns to the lobby with an empty payload. The server maintains a single global lobby session for discovery and scoped `RoomContext` sessions for drawing, enabling efficient multi-room deployments with fully isolated state per room.
 
-- **Idle Room Eviction & Storage Lifecycle** — `StorageLifecycleManager` is a background daemon that runs a garbage-collection sweep every 60 seconds, evicting rooms with zero active clients and idle longer than 5 minutes. Evicted rooms are removed from the in-memory `RoomManager` registry to reclaim heap, while all per-board WAL files are preserved on disk for potential manual recovery. Connected clients are never evicted regardless of inactivity, ensuring users in an open drawing session are never interrupted. New boards within an existing room are created on-demand with no eviction overhead.
+- **Push-to-Talk Voice Chat (`AudioEngine` / `UDP_ADMISSION`)** — `AudioEngine` implements a UDP audio data plane using `javax.sound.sampled` at 8 kHz / 16-bit signed PCM / mono / big-endian (`AUDIO_FORMAT`). Each 10 ms capture frame produces 160 bytes of PCM (`PAYLOAD_SIZE`). Wire datagrams are 196 bytes: a 36-byte null-padded UTF-8 identity token followed by the 160-byte PCM payload. Before audio can flow, the server sends a `UDP_ADMISSION` frame on the TCP channel carrying a `udpToken`; `AudioEngine.onUdpAdmission()` opens a connected `DatagramSocket`, sends a 36-byte registration punch packet, and starts the receive daemon. A dedicated capture thread (`distrisync-audio-capture`) runs at `MAX_PRIORITY`; a permanent receive daemon (`distrisync-audio-recv`) plays back incoming PCM via a lazily opened `SourceDataLine` with a 1 600-byte hardware buffer. The `UserSpeakingListener` functional interface fires on each received packet so the UI can highlight the active speaker.
+
+- **Collapsible Tools Drawer (`ToolsDrawerToggleModel`)** — drawer open/close state is extracted from `WhiteboardApp` into a pure `ToolsDrawerToggleModel`, making animation geometry (slide target X, chevron labels, panel translate X) fully unit-testable without a JavaFX runtime. The `ToggleRestSnapshot` record captures the complete settled UI state after a toggle for deterministic assertions in `ToolsDrawerToggleModelTest`.
+
+- **Idle Room Eviction & Storage Lifecycle** — `StorageLifecycleManager` is a background daemon that sweeps every 60 seconds, evicting rooms with zero active clients that have been idle longer than 5 minutes. Evicted rooms are removed from the in-memory `RoomManager` registry to reclaim heap; all per-board WAL files are preserved on disk for manual recovery. Connected clients are never interrupted regardless of inactivity, and new boards are created on-demand with no eviction overhead.
 
 ---
 
@@ -64,7 +68,7 @@ distrisync/
 ├── src/
 │   ├── main/
 │   │   ├── java/com/distrisync/
-│   │   │   ├── client/              # JavaFX UI, TCP client, UDP pointer tracker
+│   │   │   ├── client/              # JavaFX UI, TCP client, audio, UDP pointer tracker
 │   │   │   │   ├── WhiteboardApp.java
 │   │   │   │   ├── NetworkClient.java
 │   │   │   │   ├── UdpPointerTracker.java
@@ -72,7 +76,10 @@ distrisync/
 │   │   │   │   ├── LobbyUpdateListener.java
 │   │   │   │   ├── RoomInfo.java
 │   │   │   │   ├── PointerState.java
-│   │   │   │   └── PointerStateManager.java
+│   │   │   │   ├── PointerStateManager.java
+│   │   │   │   ├── AudioEngine.java
+│   │   │   │   ├── UserSpeakingListener.java
+│   │   │   │   └── ToolsDrawerToggleModel.java
 │   │   │   ├── server/              # NIO server, room routing, WAL, canvas authority
 │   │   │   │   ├── WhiteboardServer.java
 │   │   │   │   ├── NioServer.java
@@ -99,11 +106,16 @@ distrisync/
 │   │       └── logback.xml
 │   └── test/
 │       └── java/com/distrisync/
-│           ├── client/PointerStateTrackerTest.java
+│           ├── client/
+│           │   ├── AudioEngineTest.java
+│           │   ├── PointerStateTrackerTest.java
+│           │   └── ToolsDrawerToggleModelTest.java
 │           ├── integration/ClientServerIntegrationTest.java
 │           ├── protocol/MessageCodecTest.java
 │           └── server/
 │               ├── CanvasStateManagerTest.java
+│               ├── NioServerTest.java
+│               ├── NioServerUdpRoutingBufferTest.java
 │               ├── RoomManagerTest.java
 │               └── WalManagerTest.java
 ├── docs/
@@ -131,8 +143,9 @@ distrisync/
 | `LOBBY_STATE` | `0x0C` | S → C | No | JSON array of `{ roomId, userCount }` for room discovery |
 | `JOIN_ROOM` | `0x0D` | C → S | No | JSON object `{ roomId, initialBoardId? }` (legacy JSON string roomId accepted); defaults to `Board-1` |
 | `LEAVE_ROOM` | `0x0E` | C → S | No | Return from a room to lobby (empty payload) |
-| `SWITCH_BOARD` | `0x0F` | C → S | No | JSON string target board id; server responds with SNAPSHOT |
+| `SWITCH_BOARD` | `0x0F` | C → S | No | JSON string target board id; server responds with `SNAPSHOT` |
 | `BOARD_LIST_UPDATE` | `0x10` | S → C | No | JSON array of board id strings actively in use within the room |
+| `UDP_ADMISSION` | `0x11` | S → C | No | JSON object `{ udpToken }` granting access to the UDP audio data plane; client calls `AudioEngine.onUdpAdmission()` on receipt |
 
 ---
 

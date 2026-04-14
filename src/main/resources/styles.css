@@ -3,6 +3,23 @@
    Loaded via scene.getStylesheets() in WhiteboardApp.java
    ═══════════════════════════════════════════════════════════════ */
 
+/* ── Global tooltips — glass HUD (see createTooltip in WhiteboardApp) ─ */
+.tooltip {
+    -fx-background-color: rgba(15, 23, 42, 0.95);
+    -fx-text-fill: #f8fafc;
+    -fx-background-radius: 6px;
+    -fx-border-radius: 6px;
+    -fx-border-color: rgba(255, 255, 255, 0.1);
+    -fx-border-width: 1;
+    -fx-padding: 6px 12px;
+    -fx-font-size: 12px;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.5), 10, 0, 0, 2);
+}
+
+.tooltip .text {
+    -fx-fill: #f8fafc;
+}
+
 /* ── Login scene ─────────────────────────────────────────────── */
 .login-root {
     -fx-background-color: #0f172a;
@@ -305,6 +322,104 @@
 }
 
 /* ═══════════════════════════════════════════════════════════════
+   Canvas workspace — floating island HUD (Figma-style)
+   ═══════════════════════════════════════════════════════════════ */
+
+.hud-panel {
+    -fx-background-color: rgba(15, 23, 42, 0.85);
+    -fx-background-radius: 16px;
+    -fx-border-radius: 16px;
+    -fx-border-color: rgba(255, 255, 255, 0.1);
+    -fx-border-width: 1px;
+    -fx-padding: 12px;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.3), 15, 0, 0, 4);
+}
+
+.tool-btn {
+    -fx-background-color: transparent;
+    -fx-text-fill: #cbd5e1;
+    -fx-padding: 10;
+    -fx-background-radius: 10px;
+    -fx-border-width: 0;
+    -fx-cursor: hand;
+    -fx-font-size: 16px;
+}
+
+.tool-btn:hover {
+    -fx-background-color: rgba(255, 255, 255, 0.1);
+    -fx-background-radius: 10px;
+    -fx-cursor: hand;
+}
+
+.tool-btn.tool-btn-active {
+    -fx-text-fill: #ffffff;
+    -fx-background-color: rgba(59, 130, 246, 0.4);
+    -fx-font-weight: bold;
+    -fx-background-radius: 10px;
+    -fx-cursor: hand;
+}
+
+.color-picker {
+    -fx-background-color: transparent;
+    -fx-color-label-visible: false;
+    -fx-padding: 0;
+}
+
+.color-picker > .color-picker-label > .text {
+    -fx-opacity: 0;
+}
+
+.color-picker > .arrow-button {
+    -fx-opacity: 0;
+    -fx-padding: 0;
+}
+
+/* Boards trigger inside a .hud-panel — no second chrome */
+.hud-inline-action {
+    -fx-background-color: transparent;
+    -fx-border-width: 0;
+    -fx-text-fill: #e2e8f0;
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+    -fx-padding: 2 10 2 10;
+    -fx-cursor: hand;
+}
+
+.hud-inline-action:hover {
+    -fx-text-fill: #f8fafc;
+}
+
+/* PTT row: .hud-panel is required for layout max-size; chip chrome stays on .ptt-indicator */
+.hud-panel.ptt-hud-shell {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-border-width: 0;
+    -fx-padding: 0;
+    -fx-effect: null;
+}
+
+/* Tools island — dot-style ColorPicker (width capped in code) */
+.hud-panel.tools-island .tools-island-color-picker {
+    -fx-max-width: 30;
+}
+
+/* Collapsible tool drawer — slim chevron rail (right corners only) */
+.tools-drawer-toggle {
+    -fx-background-color: rgba(15, 23, 42, 0.5);
+    -fx-text-fill: #cbd5e1;
+    -fx-font-size: 10px;
+    -fx-padding: 15px 5px;
+    -fx-background-radius: 0 6px 6px 0;
+    -fx-border-width: 0;
+    -fx-cursor: hand;
+}
+
+.tools-drawer-toggle:hover {
+    -fx-background-color: rgba(15, 23, 42, 0.72);
+    -fx-text-fill: #f1f5f9;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    Canvas workspace — Figma-style tab bar (not TabPane)
    ═══════════════════════════════════════════════════════════════ */
 
@@ -436,4 +551,30 @@
 .workspace-input-dialog .button:not(:default):hover {
     -fx-background-color: #1e293b;
     -fx-text-fill: #f8fafc;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Push-to-talk floating indicator (canvas scene)
+   ═══════════════════════════════════════════════════════════════ */
+
+.ptt-indicator {
+    -fx-background-color: rgba(30, 41, 59, 0.9);
+    -fx-text-fill: #94a3b8;
+    -fx-font-weight: bold;
+    -fx-padding: 12px 24px;
+    -fx-background-radius: 30px;
+    -fx-border-radius: 30px;
+    -fx-font-size: 14px;
+}
+
+.ptt-active-self {
+    -fx-background-color: #10b981;
+    -fx-text-fill: white;
+    -fx-effect: dropshadow(gaussian, rgba(16, 185, 129, 0.5), 20, 0, 0, 0);
+}
+
+.ptt-active-other {
+    -fx-background-color: #3b82f6;
+    -fx-text-fill: white;
+    -fx-effect: dropshadow(gaussian, rgba(59, 130, 246, 0.5), 20, 0, 0, 0);
 }
