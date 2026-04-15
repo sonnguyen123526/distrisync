@@ -28,6 +28,8 @@ import java.util.Map;
  * 0x0F        SWITCH_BOARD      – client→server: JSON string target boardId (e.g. "Board-1")
  * 0x10        BOARD_LIST_UPDATE – server→client: JSON array of board id strings active in the room
  * 0x11        UDP_ADMISSION     – server→client: JSON object { udpToken } for joining the UDP audio data plane
+ * 0x12        PING              – client→server: JSON object { t } — origin {@code System.currentTimeMillis()}
+ * 0x13        PONG              – server→client: JSON object { t } — echoes the ping origin timestamp for RTT
  * </pre>
  */
 public enum MessageType {
@@ -48,7 +50,9 @@ public enum MessageType {
     LEAVE_ROOM  ((byte) 0x0E),
     SWITCH_BOARD((byte) 0x0F),
     BOARD_LIST_UPDATE((byte) 0x10),
-    UDP_ADMISSION    ((byte) 0x11);
+    UDP_ADMISSION    ((byte) 0x11),
+    PING             ((byte) 0x12),
+    PONG             ((byte) 0x13);
 
     private final byte wireCode;
 

@@ -486,6 +486,39 @@ public final class MessageCodec {
     }
 
     // -------------------------------------------------------------------------
+    // PING / PONG (telemetry RTT)
+    // -------------------------------------------------------------------------
+
+    /**
+     * JSON body for {@link MessageType#PING} and {@link MessageType#PONG}: milliseconds since
+     * Unix epoch at the ping origin (client clock when the PING was sent; echoed unchanged in PONG).
+     */
+    public record PingPongPayload(long t) {}
+
+    public static ByteBuffer encodePing(long originMillis) {
+        return encodeObject(MessageType.PING, new PingPongPayload(originMillis));
+    }
+
+    public static ByteBuffer encodePong(long originMillis) {
+        return encodeObject(MessageType.PONG, new PingPongPayload(originMillis));
+    }
+
+    /**
+     * Reads the {@code t} field from a {@code PING} or {@code PONG} payload.
+     */
+    public static long decodePingPongOrigin(Message msg) {
+        if (msg == null) throw new IllegalArgumentException("msg must not be null");
+        if (msg.type() != MessageType.PING && msg.type() != MessageType.PONG) {
+            throw new IllegalArgumentException("expected PING or PONG, got " + msg.type());
+        }
+        PingPongPayload p = GSON.fromJson(msg.payload(), PingPongPayload.class);
+        if (p == null) {
+            throw new IllegalArgumentException("missing PING/PONG payload");
+        }
+        return p.t();
+    }
+
+    // -------------------------------------------------------------------------
     // CLEAR_USER_SHAPES helpers
     // -------------------------------------------------------------------------
 

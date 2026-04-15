@@ -22,6 +22,9 @@ import com.google.gson.JsonParser;
 import com.google.gson.JsonPrimitive;
 import com.google.gson.JsonSerializationContext;
 import com.google.gson.JsonSerializer;
+import javafx.application.Platform;
+import javafx.beans.property.SimpleBooleanProperty;
+import javafx.beans.property.SimpleLongProperty;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -156,6 +159,16 @@ public final class NetworkClient implements AutoCloseable {
     /** Guards against double-connect and allows graceful shutdown signalling. */
     private final AtomicBoolean running = new AtomicBoolean(false);
 
+    /** Milliseconds since epoch embedded in the last PING; echoed in PONG for RTT. */
+    private static final int HEARTBEAT_PING_INTERVAL_MS = 2_000;
+
+    private final SimpleBooleanProperty tcpConnected = new SimpleBooleanProperty(false);
+    private final SimpleBooleanProperty udpActive = new SimpleBooleanProperty(false);
+    /** Round-trip time in ms from last PONG, or {@code -1} until the first PONG. */
+    private final SimpleLongProperty ping = new SimpleLongProperty(-1L);
+
+    private volatile Thread pingThread;
+
     /**
      * Set after the first post-handshake server message ({@code LOBBY_STATE} or
      * {@code SNAPSHOT}). {@code JOIN_ROOM} must not hit the wire before then or
@@ -264,6 +277,8 @@ public final class NetworkClient implements AutoCloseable {
             startWriteThread();
             startReadThread();
             audioEngine.startReceiveDaemon();
+            tcpConnected.set(true);
+            startHeartbeatPingThread();
         } catch (IOException e) {
             running.set(false);
             SocketChannel ch = channel;
@@ -430,6 +445,29 @@ public final class NetworkClient implements AutoCloseable {
     }
 
     /**
+     * {@code true} after a successful TCP connect until {@link #close()} or permanent disconnect.
+     */
+    public SimpleBooleanProperty tcpConnectedProperty() {
+        return tcpConnected;
+    }
+
+    /**
+     * {@code true} after {@link MessageType#UDP_ADMISSION} is handled and the UDP datagram socket
+     * is bound and connected (audio data plane ready for registration).
+     */
+    public SimpleBooleanProperty udpActiveProperty() {
+        return udpActive;
+    }
+
+    /**
+     * Last measured TCP RTT in milliseconds from {@code PONG}, or {@code -1} before the first
+     * successful measurement.
+     */
+    public SimpleLongProperty pingProperty() {
+        return ping;
+    }
+
+    /**
      * Push-to-talk audio engine (mic capture + UDP playback). Configure speaking
      * highlights via {@link AudioEngine#setUserSpeakingListener(UserSpeakingListener)}.
      */
@@ -493,6 +531,11 @@ public final class NetworkClient implements AutoCloseable {
     public void close() {
         running.set(false);
 
+        Thread pt = pingThread;
+        if (pt != null) {
+            pt.interrupt();
+        }
+
         audioEngine.close();
 
         SocketChannel ch = channel;
@@ -507,6 +550,9 @@ public final class NetworkClient implements AutoCloseable {
         // Unpark the write thread so it exits its park/loop promptly.
         Thread wt = writeThread;
         if (wt != null) LockSupport.unpark(wt);
+
+        tcpConnected.set(false);
+        udpActive.set(false);
 
         log.info("NetworkClient closed");
     }
@@ -704,6 +750,7 @@ public final class NetworkClient implements AutoCloseable {
         if (!running.get()) return;
         activeRoomId = "";
         resetWorkspaceForLobby();
+        udpActive.set(false);
         enqueueFrame(MessageCodec.encodeLeaveRoom());
         log.debug("LEAVE_ROOM enqueued");
     }
@@ -739,6 +786,7 @@ public final class NetworkClient implements AutoCloseable {
      * @throws IOException if all reconnect attempts are exhausted
      */
     private synchronized void reconnect() throws IOException {
+        udpActive.set(false);
         protocolReady.set(false);
         deferredJoinRoomId = "";
         deferredJoinBoardId = "";
@@ -816,6 +864,8 @@ public final class NetworkClient implements AutoCloseable {
                     handleDisconnect(e.getMessage());
                     accumulator.clear();
                 } catch (RuntimeException fatal) {
+                    tcpConnected.set(false);
+                    udpActive.set(false);
                     running.set(false);
                     throw fatal;
                 }
@@ -846,6 +896,8 @@ public final class NetworkClient implements AutoCloseable {
                 try {
                     handleDisconnect("protocol error");
                 } catch (RuntimeException fatal) {
+                    tcpConnected.set(false);
+                    udpActive.set(false);
                     running.set(false);
                     throw fatal;
                 }
@@ -1031,13 +1083,78 @@ public final class NetworkClient implements AutoCloseable {
                     String token = MessageCodec.decodeUdpAdmission(msg);
                     udpToken = token;
                     audioEngine.onUdpAdmission(host, port, token);
+                    udpActive.set(true);
                     log.debug("UDP_ADMISSION stored; NAT punch sent to {}:{}", host, port);
                 } catch (Exception e) {
                     log.warn("UDP_ADMISSION handling failed: {}", e.getMessage(), e);
+                    udpActive.set(false);
+                }
+            }
+            case PONG -> {
+                try {
+                    long origin = MessageCodec.decodePingPongOrigin(msg);
+                    applyPingRtt(origin);
+                } catch (Exception e) {
+                    log.debug("Malformed PONG ignored: {}", e.getMessage());
                 }
             }
             default -> log.warn("Ignoring unexpected inbound message type={} — check client/server versions",
                     msg.type());
+        }
+    }
+
+    /**
+     * Applies RTT from a decoded PONG origin timestamp (package-private for
+     * {@link NetworkClientTelemetryTest}).
+     */
+    void ingestPongForTelemetryTest(Message msg) {
+        if (msg == null || msg.type() != MessageType.PONG) {
+            throw new IllegalArgumentException("expected PONG message");
+        }
+        long origin = MessageCodec.decodePingPongOrigin(msg);
+        applyPingRtt(origin);
+    }
+
+    private void applyPingRtt(long originTimestamp) {
+        long rtt = Math.max(0L, System.currentTimeMillis() - originTimestamp);
+        runOnFxThreadIfPossible(() -> ping.set(rtt));
+    }
+
+    private static void runOnFxThreadIfPossible(Runnable action) {
+        try {
+            if (Platform.isFxApplicationThread()) {
+                action.run();
+            } else {
+                Platform.runLater(action);
+            }
+        } catch (IllegalStateException e) {
+            action.run();
+        }
+    }
+
+    private void startHeartbeatPingThread() {
+        Thread t = new Thread(this::heartbeatPingLoop, "distrisync-ping");
+        t.setDaemon(true);
+        pingThread = t;
+        t.start();
+    }
+
+    private void heartbeatPingLoop() {
+        while (running.get()) {
+            try {
+                Thread.sleep(HEARTBEAT_PING_INTERVAL_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (!running.get()) {
+                break;
+            }
+            try {
+                enqueueFrame(MessageCodec.encodePing(System.currentTimeMillis()));
+            } catch (Exception e) {
+                log.trace("PING enqueue skipped: {}", e.getMessage());
+            }
         }
     }
 
@@ -1048,6 +1165,8 @@ public final class NetworkClient implements AutoCloseable {
         } catch (IOException fatal) {
             log.error("All {} reconnect attempts exhausted — client is permanently offline",
                     MAX_RECONNECT_ATTEMPTS, fatal);
+            tcpConnected.set(false);
+            udpActive.set(false);
             running.set(false);
             throw new RuntimeException(
                     "Permanently disconnected from " + host + ":" + port

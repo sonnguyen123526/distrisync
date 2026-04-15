@@ -13,6 +13,7 @@ import javafx.animation.ScaleTransition;
 import javafx.animation.TranslateTransition;
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.beans.binding.Bindings;
 import javafx.geometry.Insets;
 import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
@@ -167,6 +168,13 @@ public class WhiteboardApp extends Application {
     private int               networkPort = DEFAULT_PORT;
     /** Fires if we stay on the lobby after requesting a room join (no SNAPSHOT). */
     private PauseTransition   lobbyJoinWatchdog;
+
+    /** Bottom-right TCP / UDP / ping telemetry strip (canvas scene). */
+    private HBox   telemetryHudRoot;
+    private Label  telemetryTcpLabel;
+    private Label  telemetryUdpLabel;
+    private Label  telemetryPingLabel;
+    private volatile boolean telemetryHudWired;
 
     /** Bottom-center push-to-talk status chip on the canvas scene. */
     private Label             pttIndicatorLabel;
@@ -350,7 +358,26 @@ public class WhiteboardApp extends Application {
         StackPane.setAlignment(pttHud, Pos.BOTTOM_CENTER);
         StackPane.setMargin(pttHud, new Insets(0, 0, 30, 0));
 
-        canvasSceneRoot.getChildren().addAll(canvasWrapper, boardsIsland, toolDrawer, topRightIsland, pttHud);
+        telemetryTcpLabel = new Label("TCP: …");
+        telemetryUdpLabel = new Label("UDP: …");
+        telemetryPingLabel = new Label("Ping: …");
+        telemetryTcpLabel.getStyleClass().add("telemetry-hud-line");
+        telemetryUdpLabel.getStyleClass().add("telemetry-hud-line");
+        telemetryPingLabel.getStyleClass().add("telemetry-hud-line");
+        Label telSep1 = new Label("|");
+        Label telSep2 = new Label("|");
+        telSep1.getStyleClass().add("telemetry-hud-sep");
+        telSep2.getStyleClass().add("telemetry-hud-sep");
+        telemetryHudRoot = new HBox(6, telemetryTcpLabel, telSep1, telemetryUdpLabel, telSep2, telemetryPingLabel);
+        telemetryHudRoot.getStyleClass().addAll("telemetry-hud", "telemetry-pill");
+        telemetryHudRoot.setPickOnBounds(false);
+        telemetryHudRoot.setMouseTransparent(true);
+        telemetryHudRoot.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
+        StackPane.setAlignment(telemetryHudRoot, Pos.BOTTOM_RIGHT);
+        StackPane.setMargin(telemetryHudRoot, new Insets(15));
+
+        canvasSceneRoot.getChildren().addAll(canvasWrapper, boardsIsland, toolDrawer, topRightIsland, pttHud,
+                telemetryHudRoot);
 
         // ── Ownership tooltip — shown when hovering over a committed shape ────
         ownerTooltip = new Tooltip();
@@ -892,12 +919,13 @@ public class WhiteboardApp extends Application {
         toolsPanel.getChildren().addAll(toolColumn, secondaryRow, toolsColorSep, colorPicker, strokeSlider);
 
         Button toolDrawerToggleBtn = new Button("<");
-        toolDrawerToggleBtn.getStyleClass().add("tools-drawer-toggle");
+        toolDrawerToggleBtn.getStyleClass().add("drawer-handle");
         toolDrawerToggleBtn.setFocusTraversable(false);
         toolDrawerToggleBtn.setMnemonicParsing(false);
         Tooltip.install(toolDrawerToggleBtn, createTooltip("Hide tools", ""));
 
         HBox toolDrawer = new HBox(0, toolsPanel, toolDrawerToggleBtn);
+        toolDrawer.setSpacing(0);
         toolDrawer.setAlignment(Pos.CENTER_LEFT);
         toolDrawer.setPickOnBounds(false);
         toolDrawer.setMaxSize(Region.USE_PREF_SIZE, Region.USE_PREF_SIZE);
@@ -1886,6 +1914,7 @@ public class WhiteboardApp extends Application {
         networkPort = port;
 
         networkClient = new NetworkClient(host, port, authorName, clientId);
+        wireTelemetryHud(networkClient);
         networkClient.getAudioEngine().setUserSpeakingListener(speakerId ->
                 Platform.runLater(() -> onRemoteUserSpeaking(speakerId)));
         networkClient.addLobbyListener(rooms ->
@@ -2111,6 +2140,43 @@ public class WhiteboardApp extends Application {
     private void setStatus(String text, String colorHex) {
         statusLabel.setText(text);
         statusLabel.setStyle("-fx-text-fill: " + colorHex + "; -fx-font-size: 12px;");
+    }
+
+    private void wireTelemetryHud(NetworkClient client) {
+        if (telemetryHudWired || client == null || telemetryTcpLabel == null) {
+            return;
+        }
+        telemetryHudWired = true;
+        telemetryTcpLabel.textProperty().bind(
+                Bindings.when(client.tcpConnectedProperty())
+                        .then("TCP: Connected")
+                        .otherwise("TCP: Disconnected"));
+        telemetryTcpLabel.styleProperty().bind(
+                Bindings.when(client.tcpConnectedProperty())
+                        .then("-fx-text-fill: #34d399;")
+                        .otherwise("-fx-text-fill: #94a3b8;"));
+        telemetryUdpLabel.textProperty().bind(
+                Bindings.when(client.udpActiveProperty())
+                        .then("UDP: Ready")
+                        .otherwise("UDP: Waiting"));
+        telemetryUdpLabel.styleProperty().bind(
+                Bindings.when(client.udpActiveProperty())
+                        .then("-fx-text-fill: #34d399;")
+                        .otherwise("-fx-text-fill: #94a3b8;"));
+        telemetryPingLabel.textProperty().bind(
+                Bindings.createStringBinding(
+                        () -> {
+                            long ms = client.pingProperty().get();
+                            if (ms < 0L) {
+                                return "Ping: —";
+                            }
+                            return "Ping: " + ms + "ms";
+                        },
+                        client.pingProperty()));
+        telemetryPingLabel.styleProperty().bind(
+                Bindings.createStringBinding(
+                        () -> "-fx-text-fill: #94a3b8;",
+                        client.pingProperty()));
     }
 
     // =========================================================================

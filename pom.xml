@@ -59,6 +59,11 @@
             <artifactId>logback-classic</artifactId>
             <version>1.5.6</version>
         </dependency>
+        <dependency>
+            <groupId>org.fusesource.jansi</groupId>
+            <artifactId>jansi</artifactId>
+            <version>2.4.1</version>
+        </dependency>
 
         <!-- Testing -->
         <dependency>
