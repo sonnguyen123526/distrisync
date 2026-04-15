@@ -321,6 +321,30 @@
     -fx-font-size: 13px;
 }
 
+/* Live telemetry strip — bottom-right canvas HUD */
+.telemetry-hud {
+    -fx-background-color: transparent;
+    -fx-text-fill: #94a3b8;
+    -fx-font-family: monospace;
+    -fx-font-size: 11px;
+    -fx-alignment: center-right;
+}
+
+.telemetry-pill {
+    -fx-background-color: rgba(15, 23, 42, 0.6);
+    -fx-background-radius: 12px;
+    -fx-padding: 4px 12px;
+}
+
+.telemetry-hud-line {
+    -fx-text-fill: #94a3b8;
+}
+
+.telemetry-hud-sep {
+    -fx-text-fill: #94a3b8;
+    -fx-opacity: 0.85;
+}
+
 /* ═══════════════════════════════════════════════════════════════
    Canvas workspace — floating island HUD (Figma-style)
    ═══════════════════════════════════════════════════════════════ */
@@ -339,6 +363,9 @@
     -fx-background-color: transparent;
     -fx-text-fill: #cbd5e1;
     -fx-padding: 10;
+    -fx-min-width: 44px;
+    -fx-pref-width: 44px;
+    -fx-max-width: 44px;
     -fx-background-radius: 10px;
     -fx-border-width: 0;
     -fx-cursor: hand;
@@ -355,6 +382,9 @@
     -fx-text-fill: #ffffff;
     -fx-background-color: rgba(59, 130, 246, 0.4);
     -fx-font-weight: bold;
+    -fx-min-width: 44px;
+    -fx-pref-width: 44px;
+    -fx-max-width: 44px;
     -fx-background-radius: 10px;
     -fx-cursor: hand;
 }
@@ -399,23 +429,29 @@
 }
 
 /* Tools island — dot-style ColorPicker (width capped in code) */
+.hud-panel.tools-island {
+    -fx-padding: 8px;
+}
+
 .hud-panel.tools-island .tools-island-color-picker {
     -fx-max-width: 30;
 }
 
-/* Collapsible tool drawer — slim chevron rail (right corners only) */
-.tools-drawer-toggle {
-    -fx-background-color: rgba(15, 23, 42, 0.5);
+/* Drawer handle: physically merged with the tools panel */
+.drawer-handle {
+    -fx-background-color: rgba(15, 23, 42, 0.85);
+    -fx-border-color: rgba(255, 255, 255, 0.1);
+    -fx-border-width: 1px 1px 1px 0px;
+    -fx-background-radius: 0 8px 8px 0;
+    -fx-border-radius: 0 8px 8px 0;
     -fx-text-fill: #cbd5e1;
     -fx-font-size: 10px;
-    -fx-padding: 15px 5px;
-    -fx-background-radius: 0 6px 6px 0;
-    -fx-border-width: 0;
+    -fx-padding: 20px 8px;
     -fx-cursor: hand;
 }
 
-.tools-drawer-toggle:hover {
-    -fx-background-color: rgba(15, 23, 42, 0.72);
+.drawer-handle:hover {
+    -fx-background-color: rgba(15, 23, 42, 0.95);
     -fx-text-fill: #f1f5f9;
 }
 

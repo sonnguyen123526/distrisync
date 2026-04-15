@@ -55,6 +55,12 @@ The client UI is built on JavaFX 21 and styled with a Tailwind-inspired `styles.
 
 - **Push-to-Talk Voice Chat (`AudioEngine` / `UDP_ADMISSION`)** — `AudioEngine` implements a UDP audio data plane using `javax.sound.sampled` at 8 kHz / 16-bit signed PCM / mono / big-endian (`AUDIO_FORMAT`). Each 10 ms capture frame produces 160 bytes of PCM (`PAYLOAD_SIZE`). Wire datagrams are 196 bytes: a 36-byte null-padded UTF-8 identity token followed by the 160-byte PCM payload. Before audio can flow, the server sends a `UDP_ADMISSION` frame on the TCP channel carrying a `udpToken`; `AudioEngine.onUdpAdmission()` opens a connected `DatagramSocket`, sends a 36-byte registration punch packet, and starts the receive daemon. A dedicated capture thread (`distrisync-audio-capture`) runs at `MAX_PRIORITY`; a permanent receive daemon (`distrisync-audio-recv`) plays back incoming PCM via a lazily opened `SourceDataLine` with a 1 600-byte hardware buffer. The `UserSpeakingListener` functional interface fires on each received packet so the UI can highlight the active speaker.
 
+- **PING/PONG RTT Telemetry** — after `HANDSHAKE` completion, `NetworkClient` starts a daemon thread (`distrisync-ping`) that fires a `PING` frame every 2 000 ms (`HEARTBEAT_PING_INTERVAL_MS`). Each `PING` payload is `{ "t": <originMillis> }` encoded via `MessageCodec.PingPongPayload`. The server echoes the origin timestamp unchanged in a `PONG` response. On receipt, `applyPingRtt(originTimestamp)` computes `RTT = max(0, System.currentTimeMillis() - originTimestamp)` and updates `SimpleLongProperty ping` on the JavaFX Application Thread. `pingProperty()` exposes the last measured RTT in ms (initial value `-1` before first measurement). `ingestPongForTelemetryTest(Message)` is a package-private test hook that drives the full RTT path without a live TCP connection.
+
+- **Server-Side Traffic Metrics Heartbeat** — `NioServer` maintains two lock-free counters: `AtomicLong bytesRouted` accumulates the total octets delivered across all TCP board fan-out writes and UDP audio relay sends (one increment per recipient per frame); `AtomicInteger activeTcpSockets` is incremented on each `OP_ACCEPT` and decremented on each channel close, providing a live socket gauge. A `ScheduledExecutorService` on the `distrisync-traffic-metrics` thread emits a structured `[METRICS]` log line every 10 seconds via `emitTrafficHeartbeat()`, recording `bytesRouted`, `roomManager.getActiveRoomCount()`, and `activeTcpSockets`. No external metrics library is required; Logback with the Jansi ANSI console appender provides coloured, human-readable output.
+
+- **Telemetry HUD** — `WhiteboardApp.wireTelemetryHud(NetworkClient)` constructs a bottom-right overlay `HBox` (CSS classes `.telemetry-hud` + `.telemetry-pill`) with three monospace label segments styled `.telemetry-hud-line`, separated by `.telemetry-hud-sep` dividers. Labels are bound directly to `tcpConnectedProperty()`, `udpActiveProperty()`, and `pingProperty()` via JavaFX property bindings; the ping label displays `"Ping: —"` while the initial value is `< 0` and `"Ping: Nms"` once the first PONG is processed.
+
 - **Collapsible Tools Drawer (`ToolsDrawerToggleModel`)** — drawer open/close state is extracted from `WhiteboardApp` into a pure `ToolsDrawerToggleModel`, making animation geometry (slide target X, chevron labels, panel translate X) fully unit-testable without a JavaFX runtime. The `ToggleRestSnapshot` record captures the complete settled UI state after a toggle for deterministic assertions in `ToolsDrawerToggleModelTest`.
 
 - **Idle Room Eviction & Storage Lifecycle** — `StorageLifecycleManager` is a background daemon that sweeps every 60 seconds, evicting rooms with zero active clients that have been idle longer than 5 minutes. Evicted rooms are removed from the in-memory `RoomManager` registry to reclaim heap; all per-board WAL files are preserved on disk for manual recovery. Connected clients are never interrupted regardless of inactivity, and new boards are created on-demand with no eviction overhead.
@@ -108,6 +114,7 @@ distrisync/
 │       └── java/com/distrisync/
 │           ├── client/
 │           │   ├── AudioEngineTest.java
+│           │   ├── NetworkClientTelemetryTest.java
 │           │   ├── PointerStateTrackerTest.java
 │           │   └── ToolsDrawerToggleModelTest.java
 │           ├── integration/ClientServerIntegrationTest.java
@@ -117,6 +124,7 @@ distrisync/
 │               ├── NioServerTest.java
 │               ├── NioServerUdpRoutingBufferTest.java
 │               ├── RoomManagerTest.java
+│               ├── ServerMetricsTest.java
 │               └── WalManagerTest.java
 ├── docs/
 │   └── Architecture.md
@@ -146,6 +154,8 @@ distrisync/
 | `SWITCH_BOARD` | `0x0F` | C → S | No | JSON string target board id; server responds with `SNAPSHOT` |
 | `BOARD_LIST_UPDATE` | `0x10` | S → C | No | JSON array of board id strings actively in use within the room |
 | `UDP_ADMISSION` | `0x11` | S → C | No | JSON object `{ udpToken }` granting access to the UDP audio data plane; client calls `AudioEngine.onUdpAdmission()` on receipt |
+| `PING` | `0x12` | C → S | No | JSON object `{ "t": <originMillis> }` sent every 2 000 ms by `distrisync-ping` thread; server must be post-handshake |
+| `PONG` | `0x13` | S → C | No | JSON object `{ "t": <originMillis> }` — server echoes the origin timestamp unchanged; client computes `RTT = now - t` |
 
 ---
 
@@ -207,6 +217,12 @@ On restart with an existing WAL:
 ```
 INFO  RoomContext     - Replaying 42 WAL record(s) for roomId='default'
 INFO  RoomContext     - WAL replay complete  roomId='default' applied=42 total=42 shapesAfterReplay=38
+```
+
+Traffic metrics heartbeat (every 10 seconds):
+
+```
+INFO  NioServer      - [METRICS] Traffic routed: 1048576 bytes | Active Rooms: 3 | Active Sockets: 12.
 ```
 
 ---

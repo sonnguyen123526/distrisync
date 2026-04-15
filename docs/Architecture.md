@@ -15,7 +15,8 @@
 5. [Room Architecture — RoomManager & RoomContext](#5-room-architecture--roommanager--roomcontext)
 6. [Write-Ahead Log — WalManager](#6-write-ahead-log--walmanager)
 7. [Pointer State Management — PointerStateManager](#7-pointer-state-management--pointerstate--pointerstate-manager)
-8. [Sequence Diagram — Two-Client Collaboration Flow](#8-sequence-diagram--two-client-collaboration-flow)
+8. [Telemetry & Observability](#8-telemetry--observability)
+9. [Sequence Diagram — Two-Client Collaboration Flow](#9-sequence-diagram--two-client-collaboration-flow)
 
 ---
 
@@ -437,7 +438,116 @@ This eliminates `Thread.sleep` in pointer eviction tests, making the entire test
 
 ---
 
-## 8. Sequence Diagram — Two-Client Collaboration Flow
+## 8. Telemetry & Observability
+
+### 8.1 PING/PONG Round-Trip Time
+
+After the `HANDSHAKE` exchange completes, `NetworkClient` starts a permanent daemon thread (`distrisync-ping`) that executes `heartbeatPingLoop()`:
+
+```
+every HEARTBEAT_PING_INTERVAL_MS (2 000 ms):
+    enqueueFrame( MessageCodec.encodePing(System.currentTimeMillis()) )
+    ─────────────────────────────────────────────────────────
+    Wire frame: PING (0x12) | payload: { "t": <originMillis> }
+```
+
+On the server, `NioServer.processMessage` handles `case PING` only for sessions where `handshakeComplete == true`:
+
+```
+origin = MessageCodec.decodePingPongOrigin(msg)   // reads "t" from JSON
+session.enqueue( MessageCodec.encodePong(origin) ) // echoes same origin timestamp
+flushWriteQueue(key, session)                       // immediate flush — no queuing delay
+```
+
+The `PingPongPayload` record in `MessageCodec` is the shared serialisation contract:
+
+```java
+public record PingPongPayload(long t) {}
+// encodePing / encodePong both write { "t": originMillis }
+// decodePingPongOrigin accepts PING or PONG and returns p.t()
+```
+
+On the client, the inbound dispatch invokes `applyPingRtt(originTimestamp)`:
+
+```java
+long rtt = Math.max(0L, System.currentTimeMillis() - originTimestamp);
+runOnFxThreadIfPossible(() -> ping.set(rtt));
+```
+
+`pingProperty()` is a `SimpleLongProperty` initialised to `-1` (meaning "no measurement yet"). `WhiteboardApp.wireTelemetryHud` binds a label to this property, displaying `"Ping: —"` while the value is negative and `"Ping: Nms"` thereafter.
+
+```
+Client                     NioServer
+  │                            │
+  │── PING (0x12) ────────────►│  { "t": 1712080800000 }
+  │                            │  case PING: decodePingPongOrigin → origin
+  │◄── PONG (0x13) ────────────│  encodePong(origin) → immediate flush
+  │                            │
+  │  applyPingRtt(origin):     │
+  │    rtt = now - origin      │
+  │    ping.set(rtt)           │
+```
+
+**Test coverage:** `NetworkClientTelemetryTest.pongReceipt_setsPingPropertyToElapsedSinceOriginTimestamp` exercises the full path via the package-private `ingestPongForTelemetryTest(Message)` hook, which bypasses the TCP read thread and calls `applyPingRtt` directly. Awaitility polls `pingProperty().get() >= 0` with a 3-second ceiling, keeping the test deterministic without `Thread.sleep`.
+
+---
+
+### 8.2 Server-Side Traffic Metrics
+
+`NioServer` maintains two lock-free in-process counters that are visible to any thread without external synchronisation:
+
+| Field | Type | Incremented by | Decremented by |
+|---|---|---|---|
+| `bytesRouted` | `AtomicLong` | `broadcastToBoard` (TCP, per recipient per frame) + `handleUdpRead` (UDP relay, per successful `send`) | Never — monotonically increasing lifetime counter |
+| `activeTcpSockets` | `AtomicInteger` | `OP_ACCEPT` handler on each `ServerSocketChannel.accept()` | `closeKey` on EOF, error, or orderly shutdown |
+
+**Why count bytes per-recipient, not per-frame?**
+
+`broadcastToBoard` enqueues a `frame.duplicate()` for each eligible peer. If three peers are present and a 1 400-byte `MUTATION` frame is broadcast, `bytesRouted` increases by 4 200 — reflecting the actual network egress, not the logical message size. This matches the accounting convention used by the `ServerMetricsTest.MockTrafficRouter`.
+
+**Traffic heartbeat:**
+
+A `ScheduledExecutorService` on the named thread `distrisync-traffic-metrics` calls `emitTrafficHeartbeat()` at a fixed rate of 10 seconds:
+
+```java
+log.info("[METRICS] Traffic routed: {} bytes | Active Rooms: {} | Active Sockets: {}.",
+        bytesRouted.get(),
+        roomManager.getActiveRoomCount(),   // ConcurrentHashMap.size()
+        activeTcpSockets.get());
+```
+
+`RoomManager.getActiveRoomCount()` returns `rooms.size()` — a thread-safe snapshot of the live room registry. No metrics framework (Micrometer, Dropwizard, Prometheus) is required; the structured `[METRICS]` prefix makes lines trivially parseable by log aggregators (Loki, Splunk, etc.) without any additional schema.
+
+**Logback configuration:** `logback.xml` configures a CONSOLE appender with Jansi ANSI colour encoding and a rolling FILE appender (`logs/distrisync.log`, daily rollover, 7-day retention). The `com.distrisync` logger is set to `DEBUG`; all other loggers inherit the `INFO` root level.
+
+---
+
+### 8.3 Telemetry HUD
+
+`WhiteboardApp.wireTelemetryHud(NetworkClient client)` constructs a non-interactive overlay anchored to the bottom-right corner of the canvas pane:
+
+```
+┌─────────────────────────────────┐
+│  TCP: ● Connected  │  UDP: ●  │  Ping: 12ms  │
+└─────────────────────────────────┘
+     .telemetry-hud + .telemetry-pill
+     child labels: .telemetry-hud-line
+     dividers:     .telemetry-hud-sep
+```
+
+All three segments are bound via JavaFX property expressions — no polling timer is involved:
+
+| Segment | Bound to | Displayed value |
+|---|---|---|
+| TCP status | `client.tcpConnectedProperty()` | `"TCP: ● Connected"` / `"TCP: ○ Disconnected"` |
+| UDP status | `client.udpActiveProperty()` | `"UDP: ●"` / `"UDP: ○"` |
+| Ping | `client.pingProperty()` | `"Ping: —"` (while `< 0`) or `"Ping: Nms"` |
+
+The HUD is positioned using `AnchorPane` constraints and carries no mouse event handlers (`setMouseTransparent(true)`), ensuring it never interferes with canvas interaction. The `.telemetry-hud` CSS class sets a transparent background and 11 px monospace font; `.telemetry-pill` provides a subtle rounded-rectangle container with inner padding.
+
+---
+
+## 9. Sequence Diagram — Two-Client Collaboration Flow
 
 The diagram below shows the complete lifecycle: two clients connecting, snapshot delivery with WAL recovery, Client 1 streaming a live draw gesture, a final committed `MUTATION` (persisted to WAL), and the server broadcasting all of these to Client 2.
 
@@ -482,6 +592,14 @@ sequenceDiagram
     C2->>SRV: HANDSHAKE (0x01)<br/>{ authorName:"Bob", clientId:"bob-uuid" }
     Note over SRV: session₂.authorName = "Bob"<br/>session₂.clientId  = "bob-uuid"
     SRV->>RM: addKey(room, key₂)
+
+    %% ── PING/PONG RTT heartbeat ─────────────────────────────────────
+    rect rgb(245, 245, 245)
+        Note over C1,SRV: PING/PONG telemetry — runs every 2 000 ms post-handshake
+        C1->>SRV: PING (0x12)<br/>{ "t": 1712080800000 }
+        SRV-->>C1: PONG (0x13)<br/>{ "t": 1712080800000 }
+        Note over C1: rtt = now − t → ping.set(rtt)<br/>HUD: "Ping: 12ms"
+    end
 
     %% ── Client 1 streams a live draw gesture ───────────────────────────
     rect rgb(230, 245, 255)
@@ -532,6 +650,7 @@ sequenceDiagram
 | 1–5  | On startup, `RoomManager` calls `WalManager.recover` and replays all persisted frames into `CanvasStateManager` before any client is allowed to join. A post-crash restart delivers a fully recovered `SNAPSHOT` to the first reconnecting peer. |
 | 6–12 | Client 1 performs a full TCP handshake. The server immediately delivers a `SNAPSHOT` so the client renders any pre-existing (or recovered) board state before sending its own `HANDSHAKE`. `RoomManager.addKey` registers the connection in the room's broadcast set. |
 | 13–19 | Client 2 connects identically. From this point both clients are in the same room, registered on the same `Selector` and the same `RoomContext.activeKeys`. |
-| 20–27 | The three-phase live draw (`SHAPE_START` → `SHAPE_UPDATE` × N → `SHAPE_COMMIT`) is **purely ephemeral**. The server relays each frame via the room broadcast but never calls `applyMutation()` or `appendToWal()`. Client 2 sees a live preview with zero persistence cost. |
-| 28–34 | The final `MUTATION` triggers `CanvasStateManager.applyMutation()`. Only if the CAS succeeds (newer Lamport timestamp) does the server call `appendToWal` and then broadcast the frame. The WAL write happens **before** the broadcast so the record is durable even if the network write fails. |
-| 35–42 | `UNDO_REQUEST` arrives. The server issues one `ConcurrentHashMap.remove()` call, then appends a `SHAPE_DELETE` frame to the WAL so the deletion survives a crash, and broadcasts to room peers. The requesting client is intentionally excluded from the broadcast — it removes the shape optimistically. |
+| 20–22 | After `HANDSHAKE` completes, `NetworkClient` starts the `distrisync-ping` daemon thread. Every 2 000 ms it enqueues a `PING` frame carrying `{ "t": <originMillis> }`. The server echoes the origin timestamp in a `PONG` response; the client computes `RTT = now − t` and updates `pingProperty()`, which the Telemetry HUD reflects immediately via property binding. |
+| 23–30 | The three-phase live draw (`SHAPE_START` → `SHAPE_UPDATE` × N → `SHAPE_COMMIT`) is **purely ephemeral**. The server relays each frame via the room broadcast but never calls `applyMutation()` or `appendToWal()`. Client 2 sees a live preview with zero persistence cost. |
+| 31–37 | The final `MUTATION` triggers `CanvasStateManager.applyMutation()`. Only if the CAS succeeds (newer Lamport timestamp) does the server call `appendToWal` and then broadcast the frame. The WAL write happens **before** the broadcast so the record is durable even if the network write fails. Each broadcast recipient's frame bytes are added to `NioServer.bytesRouted`. |
+| 38–45 | `UNDO_REQUEST` arrives. The server issues one `ConcurrentHashMap.remove()` call, then appends a `SHAPE_DELETE` frame to the WAL so the deletion survives a crash, and broadcasts to room peers. The requesting client is intentionally excluded from the broadcast — it removes the shape optimistically. |

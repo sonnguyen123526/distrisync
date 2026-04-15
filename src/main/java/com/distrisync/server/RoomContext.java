@@ -94,6 +94,7 @@ final class RoomContext {
     private void replayWalForBoard(String boardId, CanvasStateManager stateManager) {
         if (wal == null) return;
 
+        long t0 = System.nanoTime();
         List<Message> frames;
         try {
             frames = wal.recover(roomId, boardId);
@@ -139,7 +140,8 @@ final class RoomContext {
             }
         }
 
-        log.info("WAL replay complete  room='{}' board='{}' framesRead={} framesApplied={} shapes={}",
-                roomId, boardId, frames.size(), applied, stateManager.size());
+        long elapsedMs = (System.nanoTime() - t0) / 1_000_000L;
+        log.info("[WAL] Replayed {} frames for {}_{} in {}ms. Canvas restored.",
+                frames.size(), roomId, boardId, elapsedMs);
     }
 }

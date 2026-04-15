@@ -33,6 +33,11 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Central-authority server for the DistriSync collaborative whiteboard.
@@ -105,6 +110,12 @@ public final class NioServer implements Runnable {
     private final CharsetEncoder udpClientIdEncoder = StandardCharsets.UTF_8.newEncoder()
             .onMalformedInput(CodingErrorAction.REPLACE)
             .onUnmappableCharacter(CodingErrorAction.REPLACE);
+
+    /** Bytes handed to the TCP board fan-out and UDP audio relay (per-peer datagram octets). */
+    private final AtomicLong bytesRouted = new AtomicLong();
+
+    /** Connected TCP client channels (excluding the accept socket and UDP channel). */
+    private final AtomicInteger activeTcpSockets = new AtomicInteger();
 
     /**
      * Completes with the actual TCP port the server bound to.  Useful when
@@ -180,20 +191,31 @@ public final class NioServer implements Runnable {
 
             log.info("NioServer listening — tcpUdpPort={} (TCP + UDP) minConcurrentClients=4", actualPort);
 
-            while (!stopped && !Thread.currentThread().isInterrupted()) {
-                selector.select();
-                drainPendingLobbyBroadcasts();
+            ScheduledExecutorService trafficHeartbeat = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "distrisync-traffic-metrics");
+                t.setDaemon(true);
+                return t;
+            });
+            try {
+                trafficHeartbeat.scheduleAtFixedRate(this::emitTrafficHeartbeat, 10, 10, TimeUnit.SECONDS);
 
-                Set<SelectionKey> selected = selector.selectedKeys();
-                for (SelectionKey key : selected) {
-                    try {
-                        dispatch(key, selector);
-                    } catch (Exception e) {
-                        log.error("Unexpected error dispatching key — closing channel: {}", e.getMessage(), e);
-                        closeKey(key);
+                while (!stopped && !Thread.currentThread().isInterrupted()) {
+                    selector.select();
+                    drainPendingLobbyBroadcasts();
+
+                    Set<SelectionKey> selected = selector.selectedKeys();
+                    for (SelectionKey key : selected) {
+                        try {
+                            dispatch(key, selector);
+                        } catch (Exception e) {
+                            log.error("Unexpected error dispatching key — closing channel: {}", e.getMessage(), e);
+                            closeKey(key);
+                        }
                     }
+                    selected.clear();
                 }
-                selected.clear();
+            } finally {
+                trafficHeartbeat.shutdownNow();
             }
 
         } catch (IOException e) {
@@ -254,6 +276,7 @@ public final class NioServer implements Runnable {
         ClientSession session = new ClientSession();
         clientChannel.register(selector, SelectionKey.OP_READ, session);
 
+        activeTcpSockets.incrementAndGet();
         log.info("Client connected  session={} remote={} — awaiting HANDSHAKE",
                 session.sessionId, clientChannel.getRemoteAddress());
     }
@@ -306,6 +329,21 @@ public final class NioServer implements Runnable {
         } finally {
             session.readBuffer.compact();
         }
+    }
+
+    private void emitTrafficHeartbeat() {
+        log.info("[METRICS] Traffic routed: {} bytes | Active Rooms: {} | Active Sockets: {}.",
+                bytesRouted.get(),
+                roomManager.getActiveRoomCount(),
+                activeTcpSockets.get());
+    }
+
+    private static String clientLogLabel(ClientSession session) {
+        String id = session.clientId;
+        if (id != null && !id.isBlank()) {
+            return id;
+        }
+        return session.sessionId.toString();
     }
 
     // =========================================================================
@@ -362,8 +400,8 @@ public final class NioServer implements Runnable {
                     sendSnapshot(session, senderKey, room);
                     sendUdpAdmission(session, senderKey, udpToken);
                     broadcastBoardList(room);
-                    log.info("JOIN_ROOM session={} roomId='{}' boardId='{}'",
-                            session.sessionId, rid, session.currentBoardId);
+                    log.info("[TCP] Client {} joined Room '{}'. Active users: {}.",
+                            clientLogLabel(session), rid, room.getActiveClientCount());
                 } catch (IllegalArgumentException e) {
                     log.warn("JOIN_ROOM rejected session={}: {}", session.sessionId, e.getMessage());
                 }
@@ -406,7 +444,7 @@ public final class NioServer implements Runnable {
                 boolean applied = board.applyMutation(shape);
 
                 if (applied) {
-                    log.info("MUTATION accepted  type={} id={} ts={} author='{}' room='{}' board='{}' from={}",
+                    log.debug("MUTATION accepted  type={} id={} ts={} author='{}' room='{}' board='{}' from={}",
                             shape.getClass().getSimpleName(), shape.objectId(),
                             shape.timestamp(), shape.authorName(), session.roomId, session.currentBoardId,
                             session.sessionId);
@@ -465,7 +503,7 @@ public final class NioServer implements Runnable {
                 }
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
                 board.clearUserShapes(targetClientId);
-                log.info("CLEAR_USER_SHAPES  room='{}' board='{}' from session={} targetClientId='{}'",
+                log.debug("CLEAR_USER_SHAPES  room='{}' board='{}' from session={} targetClientId='{}'",
                         session.roomId, session.currentBoardId, session.sessionId, targetClientId);
 
                 // Persist to WAL so the per-user purge survives a restart.
@@ -495,7 +533,7 @@ public final class NioServer implements Runnable {
                 CanvasStateManager board = room.getBoard(session.currentBoardId);
                 boolean deleted = board.deleteShape(shapeId);
                 if (deleted) {
-                    log.info("UNDO_REQUEST accepted  shapeId={} room='{}' board='{}' author='{}' session={}",
+                    log.debug("UNDO_REQUEST accepted  shapeId={} room='{}' board='{}' author='{}' session={}",
                             shapeId, session.roomId, session.currentBoardId, session.authorName, session.sessionId);
                     record ShapeDeletePayload(String shapeId) {}
                     var deletePayload = new ShapeDeletePayload(shapeId.toString());
@@ -539,10 +577,30 @@ public final class NioServer implements Runnable {
                 if (!boardExisted) {
                     broadcastBoardList(room);
                 }
-                log.info("SWITCH_BOARD session={} room='{}' boardId='{}'", session.sessionId, session.roomId, bid);
+                log.info("[STATE] Client {} switched to Board '{}'. Hydrating state.",
+                        clientLogLabel(session), bid);
             }
 
             case LOBBY_STATE -> log.trace("Ignoring client-originated LOBBY_STATE echo session={}", session.sessionId);
+
+            case PING -> {
+                if (!session.handshakeComplete) {
+                    log.trace("PING before HANDSHAKE ignored session={}", session.sessionId);
+                    break;
+                }
+                long origin;
+                try {
+                    origin = MessageCodec.decodePingPongOrigin(msg);
+                } catch (Exception e) {
+                    log.warn("Malformed PING session={}: {}", session.sessionId, e.getMessage());
+                    break;
+                }
+                session.enqueue(MessageCodec.encodePong(origin));
+                if (!flushWriteQueue(session, senderKey)) {
+                    log.error("PONG flush failed for session={} — closing connection", session.sessionId);
+                    closeKey(senderKey);
+                }
+            }
 
             default -> log.warn("Unexpected message type={} from session={} — ignoring",
                     msg.type(), session.sessionId);
@@ -591,7 +649,9 @@ public final class NioServer implements Runnable {
         if (!flushWriteQueue(session, key)) {
             log.error("UDP_ADMISSION flush failed for session={} — closing connection", session.sessionId);
             closeKey(key);
+            return;
         }
+        log.info("[UDP] Granted admission token for Client {}. Data plane ready.", clientLogLabel(session));
     }
 
     private void handleUdpRead(SelectionKey key) {
@@ -663,6 +723,7 @@ public final class NioServer implements Runnable {
             try {
                 udpBuffer.rewind();
                 dc.send(udpBuffer, dest);
+                bytesRouted.addAndGet(len);
             } catch (IOException e) {
                 log.debug("UDP relay send to {} failed: {}", dest, e.getMessage());
             }
@@ -699,7 +760,7 @@ public final class NioServer implements Runnable {
         Message snapshotMsg = new Message(MessageType.SNAPSHOT, payload);
         ByteBuffer frame = MessageCodec.encode(snapshotMsg);
 
-        log.info("Sending SNAPSHOT  room='{}' shapes={} bytes={} to={}",
+        log.debug("Sending SNAPSHOT  room='{}' shapes={} bytes={} to={}",
                 room.roomId, shapes.size(), frame.remaining(), session.sessionId);
 
         session.enqueue(frame);
@@ -772,6 +833,7 @@ public final class NioServer implements Runnable {
             return;
         }
 
+        int frameBytes = frame.remaining();
         List<SelectionKey> toClose = new ArrayList<>();
         int recipientCount = 0;
 
@@ -790,6 +852,7 @@ public final class NioServer implements Runnable {
             if (!flushWriteQueue(session, key)) {
                 toClose.add(key);
             } else {
+                bytesRouted.addAndGet(frameBytes);
                 recipientCount++;
             }
         }
@@ -887,6 +950,7 @@ public final class NioServer implements Runnable {
             } else if (!s.roomId.isBlank()) {
                 roomManager.removeClientFromRoom(s.roomId, key);
             }
+            activeTcpSockets.decrementAndGet();
             log.info("Closing channel  session={} room='{}'", s.sessionId,
                     s.roomId.isBlank() ? "(lobby)" : s.roomId);
         } else {
@@ -922,6 +986,11 @@ public final class NioServer implements Runnable {
      */
     ConcurrentHashMap<String, ClientSession> udpTokenRegistryForTests() {
         return udpTokenToSession;
+    }
+
+    /** Bytes routed through board-scoped TCP fan-out and UDP audio relay since server start. */
+    public long getBytesRouted() {
+        return bytesRouted.get();
     }
 
     /**

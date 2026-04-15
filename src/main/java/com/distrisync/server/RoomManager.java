@@ -167,7 +167,7 @@ public final class RoomManager {
             throw new IllegalArgumentException("roomId must not be null or blank");
         }
         return rooms.computeIfAbsent(roomId, id -> {
-            log.info("Creating room  roomId='{}'", id);
+            log.debug("Creating room  roomId='{}'", id);
             return new RoomContext(id, walManager);
         });
     }
@@ -298,5 +298,10 @@ public final class RoomManager {
      */
     ConcurrentHashMap<String, RoomContext> getRooms() {
         return rooms;
+    }
+
+    /** Current number of rooms in the routing table (including empty rooms). */
+    public int getActiveRoomCount() {
+        return rooms.size();
     }
 }
