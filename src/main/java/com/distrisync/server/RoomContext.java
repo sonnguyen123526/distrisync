@@ -79,6 +79,14 @@ final class RoomContext {
         return Collections.unmodifiableSet(activeKeys);
     }
 
+    /**
+     * Live backing set for selector-thread read-only iteration (no per-call unmodifiable wrapper).
+     * Do not mutate membership except via {@link #addKey} / {@link #removeKey}.
+     */
+    Set<SelectionKey> activeKeysForSelectorIteration() {
+        return activeKeys;
+    }
+
     int getActiveClientCount() {
         return activeKeys.size();
     }

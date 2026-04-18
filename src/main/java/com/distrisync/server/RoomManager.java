@@ -285,11 +285,30 @@ public final class RoomManager {
     /**
      * Removes the room from the routing table.  Called by
      * {@link StorageLifecycleManager} when a room is GC-eligible.
+     *
+     * <p>Eviction is applied only if the routing entry still exists and still has
+     * zero active clients, so a client that joins between the GC sweep and this
+     * call cannot be dropped from the map.
      */
     void removeRoom(String roomId) {
-        rooms.remove(roomId);
-        log.info("Room evicted by GC  roomId='{}'", roomId);
-        notifyLobbySubscribers();
+        if (roomId == null || roomId.isBlank()) {
+            return;
+        }
+        final boolean[] evicted = {false};
+        rooms.compute(roomId, (id, ctx) -> {
+            if (ctx == null) {
+                return null;
+            }
+            if (ctx.getActiveClientCount() != 0) {
+                return ctx;
+            }
+            log.info("Room evicted by GC  roomId='{}'", id);
+            evicted[0] = true;
+            return null;
+        });
+        if (evicted[0]) {
+            notifyLobbySubscribers();
+        }
     }
 
     /**

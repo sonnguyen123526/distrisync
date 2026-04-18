@@ -1,0 +1,11 @@
+services:
+  distrisync-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9090:9090/tcp"
+      - "9090:9090/udp"
+    volumes:
+      - ./distrisync-data:/app/distrisync-data
+    restart: unless-stopped

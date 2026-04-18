@@ -1222,6 +1222,10 @@ public class WhiteboardApp extends Application {
         cancelLobbyJoinWatchdog();
         hideBoardSwitcher();
         boardSnapshots.clear();
+        unwireCanvasMouseEvents();
+        if (udpTracker != null) {
+            udpTracker.clearPeerCursors();
+        }
         if (networkClient != null) {
             networkClient.sendLeaveRoom();
         }
@@ -1392,6 +1396,23 @@ public class WhiteboardApp extends Application {
      * {@code transientCanvas}; on release the path is committed as a series
      * of {@link Line} mutations.
      */
+    /**
+     * Clears drawing / hover handlers on the canvas stack while in the lobby so
+     * transient input cannot fire against an invisible scene; handlers are
+     * re-attached from {@link #onSnapshotReceived} when the user re-enters a room.
+     */
+    private void unwireCanvasMouseEvents() {
+        if (canvasStackPane == null) {
+            return;
+        }
+        canvasStackPane.setOnMousePressed(null);
+        canvasStackPane.setOnMouseDragged(null);
+        canvasStackPane.setOnMouseReleased(null);
+        canvasStackPane.setOnMouseMoved(null);
+        canvasStackPane.setOnMouseEntered(null);
+        canvasStackPane.setOnMouseExited(null);
+    }
+
     private void wireMouseEvents(StackPane target) {
         target.setOnMousePressed(e -> {
             ownerTooltip.hide();
@@ -1927,6 +1948,9 @@ public class WhiteboardApp extends Application {
             public void onSnapshotReceived(List<Shape> incoming) {
                 Platform.runLater(() -> {
                     cancelLobbyJoinWatchdog();
+                    if (canvasStackPane != null) {
+                        wireMouseEvents(canvasStackPane);
+                    }
                     List<Shape> list = incoming != null ? incoming : List.of();
                     roomId = networkClient != null ? networkClient.getActiveRoomId() : "";
                     Scene cur = primaryStage != null ? primaryStage.getScene() : null;

@@ -180,12 +180,13 @@ public final class MessageCodec {
 
             // --- Guard: need the full payload -----------------------------------
             if (buffer.remaining() < payloadLength) {
-                int missing = payloadLength - buffer.remaining();
+                int payloadBytesAvailable = buffer.remaining();
+                int missing = payloadLength - payloadBytesAvailable;
                 // Rewind before throwing so caller can retry after buffering more data.
                 buffer.position(startPosition);
                 throw new PartialMessageException(
                         "Incomplete payload: need " + payloadLength
-                        + " bytes, have " + buffer.remaining()
+                        + " bytes, have " + payloadBytesAvailable
                         + " (missing " + missing + ")",
                         missing);
             }

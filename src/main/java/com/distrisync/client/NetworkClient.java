@@ -277,7 +277,7 @@ public final class NetworkClient implements AutoCloseable {
             startWriteThread();
             startReadThread();
             audioEngine.startReceiveDaemon();
-            tcpConnected.set(true);
+            publishTcpConnected(true);
             startHeartbeatPingThread();
         } catch (IOException e) {
             running.set(false);
@@ -551,8 +551,8 @@ public final class NetworkClient implements AutoCloseable {
         Thread wt = writeThread;
         if (wt != null) LockSupport.unpark(wt);
 
-        tcpConnected.set(false);
-        udpActive.set(false);
+        publishTcpConnected(false);
+        publishUdpActive(false);
 
         log.info("NetworkClient closed");
     }
@@ -750,7 +750,7 @@ public final class NetworkClient implements AutoCloseable {
         if (!running.get()) return;
         activeRoomId = "";
         resetWorkspaceForLobby();
-        udpActive.set(false);
+        publishUdpActive(false);
         enqueueFrame(MessageCodec.encodeLeaveRoom());
         log.debug("LEAVE_ROOM enqueued");
     }
@@ -786,7 +786,7 @@ public final class NetworkClient implements AutoCloseable {
      * @throws IOException if all reconnect attempts are exhausted
      */
     private synchronized void reconnect() throws IOException {
-        udpActive.set(false);
+        publishUdpActive(false);
         protocolReady.set(false);
         deferredJoinRoomId = "";
         deferredJoinBoardId = "";
@@ -864,8 +864,8 @@ public final class NetworkClient implements AutoCloseable {
                     handleDisconnect(e.getMessage());
                     accumulator.clear();
                 } catch (RuntimeException fatal) {
-                    tcpConnected.set(false);
-                    udpActive.set(false);
+                    publishTcpConnected(false);
+                    publishUdpActive(false);
                     running.set(false);
                     throw fatal;
                 }
@@ -896,8 +896,8 @@ public final class NetworkClient implements AutoCloseable {
                 try {
                     handleDisconnect("protocol error");
                 } catch (RuntimeException fatal) {
-                    tcpConnected.set(false);
-                    udpActive.set(false);
+                    publishTcpConnected(false);
+                    publishUdpActive(false);
                     running.set(false);
                     throw fatal;
                 }
@@ -1083,11 +1083,11 @@ public final class NetworkClient implements AutoCloseable {
                     String token = MessageCodec.decodeUdpAdmission(msg);
                     udpToken = token;
                     audioEngine.onUdpAdmission(host, port, token);
-                    udpActive.set(true);
+                    publishUdpActive(true);
                     log.debug("UDP_ADMISSION stored; NAT punch sent to {}:{}", host, port);
                 } catch (Exception e) {
                     log.warn("UDP_ADMISSION handling failed: {}", e.getMessage(), e);
-                    udpActive.set(false);
+                    publishUdpActive(false);
                 }
             }
             case PONG -> {
@@ -1118,6 +1118,19 @@ public final class NetworkClient implements AutoCloseable {
     private void applyPingRtt(long originTimestamp) {
         long rtt = Math.max(0L, System.currentTimeMillis() - originTimestamp);
         runOnFxThreadIfPossible(() -> ping.set(rtt));
+    }
+
+    /**
+     * JavaFX {@link SimpleBooleanProperty} updates used by the UI must run on the
+     * FX Application Thread; {@link #connect()}, I/O threads, and {@link #close()}
+     * may run elsewhere.
+     */
+    private void publishTcpConnected(boolean connected) {
+        runOnFxThreadIfPossible(() -> tcpConnected.set(connected));
+    }
+
+    private void publishUdpActive(boolean active) {
+        runOnFxThreadIfPossible(() -> udpActive.set(active));
     }
 
     private static void runOnFxThreadIfPossible(Runnable action) {
@@ -1165,8 +1178,8 @@ public final class NetworkClient implements AutoCloseable {
         } catch (IOException fatal) {
             log.error("All {} reconnect attempts exhausted — client is permanently offline",
                     MAX_RECONNECT_ATTEMPTS, fatal);
-            tcpConnected.set(false);
-            udpActive.set(false);
+            publishTcpConnected(false);
+            publishUdpActive(false);
             running.set(false);
             throw new RuntimeException(
                     "Permanently disconnected from " + host + ":" + port

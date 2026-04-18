@@ -77,6 +77,7 @@ distrisync/
 │   │   │   ├── client/              # JavaFX UI, TCP client, audio, UDP pointer tracker
 │   │   │   │   ├── WhiteboardApp.java
 │   │   │   │   ├── NetworkClient.java
+│   │   │   │   ├── WhiteboardClient.java
 │   │   │   │   ├── UdpPointerTracker.java
 │   │   │   │   ├── CanvasUpdateListener.java
 │   │   │   │   ├── LobbyUpdateListener.java
@@ -123,11 +124,12 @@ distrisync/
 │               ├── CanvasStateManagerTest.java
 │               ├── NioServerTest.java
 │               ├── NioServerUdpRoutingBufferTest.java
+│               ├── RoomContextTest.java
 │               ├── RoomManagerTest.java
 │               ├── ServerMetricsTest.java
 │               └── WalManagerTest.java
-├── docs/
-│   └── Architecture.md
+├── Dockerfile              # Multi-stage backend image (Maven → Temurin 21 JRE)
+├── docker-compose.yml      # distrisync-server: TCP+UDP 9090, WAL volume, restart policy
 └── pom.xml
 ```
 
@@ -163,11 +165,12 @@ distrisync/
 
 | Requirement | Minimum Version |
 |---|---|
-| JDK | 21 |
-| Apache Maven | 3.8+ |
-| Network | Server and clients on the same subnet (UDP multicast) |
+| JDK | 21 (for local builds and the JavaFX client; not required on the host to *run* the server in Docker) |
+| Apache Maven | 3.8+ (or use the repository `mvnw` / `mvnw.cmd` wrapper) |
+| Docker Desktop (optional) | Recent **Docker Compose** v2 for containerised server |
+| Network | Server and clients on the same subnet (UDP multicast for pointer presence) |
 
-> **Note:** Ensure `JAVA_HOME` points to a JDK 21 installation and `mvn` is on your `PATH` before proceeding.
+> **Note:** For a local (non-Docker) server or client, ensure `JAVA_HOME` points to a JDK 21 installation. From the repository root, prefer the Maven wrapper: **`.\mvnw.cmd`** on Windows, **`./mvnw`** on macOS/Linux (instead of requiring a global `mvn` on `PATH`).
 
 ---
 
@@ -178,31 +181,55 @@ distrisync/
 Run once from the repository root to compile sources and execute all unit tests:
 
 ```powershell
-mvn clean install
+.\mvnw.cmd clean install
 ```
 
 ---
 
 ### 2. Start the Server
 
-The server binds on TCP port **9090** by default. An optional positional argument overrides the port. WAL files are written to `distrisync-data/` in the working directory and created automatically on first run.
+The server listens on **TCP 9090** for the framed control protocol. The container image also **exposes UDP 9090** so host port mappings can carry server-routed UDP traffic (for example push-to-talk relay) on the same port number alongside TCP.
+
+#### Option A — Docker Compose (backend only)
+
+The root **`Dockerfile`** is a multi-stage build: **`maven:3.9.6-eclipse-temurin-21`** copies **`pom.xml`** first and runs **`mvn -B dependency:go-offline -DskipTests`** so dependency layers cache separately; then **`src/`** is copied and the project is built with **`mvn -B package -DskipTests`**, runtime JARs are copied to **`target/dependency`**, and the main artifact is renamed to **`server.jar`**. The runtime stage uses **`eclipse-temurin:21-jre-jammy`** with **`WORKDIR /app`**, copies **`server.jar`** plus **`lib/`**, and starts **`com.distrisync.server.WhiteboardServer`** on port **9090** with WAL data under **`/app/distrisync-data`** (bind-mounted from the host).
+
+From the repository root:
+
+```powershell
+docker compose up --build
+```
+
+The Compose file defines a **`distrisync-server`** service that **builds** the local `Dockerfile`, publishes **both protocols** on the host (`9090/tcp` and `9090/udp`), mounts **`./distrisync-data:/app/distrisync-data`** so WAL files survive container recreation, and sets **`restart: unless-stopped`**.
+
+You do not need a local JDK or Maven run to produce the server binary when using this path; the build runs entirely inside the image.
+
+To build the image without starting a long-running container:
+
+```powershell
+docker compose build
+```
+
+#### Option B — Maven or JAR on the host
+
+The server binds on TCP port **9090** by default. Optional positional arguments override **port** and **WAL directory** (see `WhiteboardServer` usage in source). For local runs, WAL files are typically under **`distrisync-data/`** in the working directory and are created on first use.
 
 **Default port (9090):**
 
 ```powershell
-mvn exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer"
+.\mvnw.cmd exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer"
 ```
 
 **Custom port (e.g., 8080):**
 
 ```powershell
-mvn exec:java -Dexec.mainClass=com.distrisync.server.WhiteboardServer -Dexec.args="8080"
+.\mvnw.cmd exec:java "-Dexec.mainClass=com.distrisync.server.WhiteboardServer" "-Dexec.args=8080"
 ```
 
-**Alternatively, run the assembled JAR directly:**
+**Alternatively, run the assembled JAR with runtime dependencies on the classpath** (after `.\mvnw.cmd package`, dependencies are under `target/dependency/`):
 
 ```powershell
-java -cp target/distrisync-0.1.0-SNAPSHOT.jar com.distrisync.server.WhiteboardServer
+java -cp "target\distrisync-0.1.0-SNAPSHOT.jar;target\dependency\*" com.distrisync.server.WhiteboardServer
 ```
 
 Expected console output on successful bind:
@@ -229,32 +256,32 @@ INFO  NioServer      - [METRICS] Traffic routed: 1048576 bytes | Active Rooms: 3
 
 ### 3. Start a Client
 
-Each client instance is an independent JavaFX process. Launch as many as needed; all instances connecting to the same server address will share the canvas in real time.
+Each client instance is an independent JavaFX process. Launch as many as needed; all instances connecting to the same server address will share the canvas in real time. If the backend is running via **Docker Compose**, use the default **localhost** and **9090** (both TCP and UDP must be reachable from the client host for full voice and relay behaviour).
 
 **Connect to localhost (default host/port):**
 
 ```powershell
-mvn javafx:run
+.\mvnw.cmd javafx:run
 ```
 
 **Connect to a specific host and port:**
 
 ```powershell
-mvn javafx:run "-Djavafx.args=192.168.1.100 9090"
+.\mvnw.cmd javafx:run "-Djavafx.args=192.168.1.100 9090"
 ```
 
-> Open multiple terminals and run `mvn javafx:run` in each to simulate multiple collaborating peers locally.
+> Open multiple terminals and run `.\mvnw.cmd javafx:run` in each to simulate multiple collaborating peers locally.
 
 ---
 
 ### 4. Run Tests Only
 
 ```powershell
-mvn test
+.\mvnw.cmd test
 ```
 
 ---
 
 ## License
 
-This project is released under the [MIT License](LICENSE).
+This project is released under the MIT License.

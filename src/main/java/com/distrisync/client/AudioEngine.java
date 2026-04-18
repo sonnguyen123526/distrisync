@@ -14,6 +14,7 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -34,6 +35,11 @@ public final class AudioEngine implements AutoCloseable {
     private static final int UDP_IDENTITY_BYTES = 36;
     /** 10 ms of PCM at {@link #AUDIO_FORMAT}: 8000 Hz × 2 bytes × 0.01 s = 160 bytes. */
     public static final int PAYLOAD_SIZE = 160;
+    /**
+     * javax.sound sampled internal buffer: 10 frames × {@link #PAYLOAD_SIZE} = 1 600 bytes
+     * to keep the OS/driver queue shallow (≈100 ms at this frame size).
+     */
+    private static final int LINE_BUFFER_BYTES = 10 * PAYLOAD_SIZE;
     /** Wire datagram: 36-byte identity + {@link #PAYLOAD_SIZE} audio = 196 bytes. */
     private static final int UDP_PACKET_BYTES = UDP_IDENTITY_BYTES + PAYLOAD_SIZE;
     /** Completes a big-endian 16-bit sample when {@link TargetDataLine#read} returns an odd byte count. */
@@ -56,6 +62,11 @@ public final class AudioEngine implements AutoCloseable {
     private volatile Thread receiveThread;
 
     private volatile UserSpeakingListener userSpeakingListener;
+
+    /** Last 36-byte relay header (selector of {@link #rxSpeakerIdCached}). */
+    private final byte[] rxIdentityMatch = new byte[UDP_IDENTITY_BYTES];
+    private boolean rxSpeakerIdCacheValid;
+    private String rxSpeakerIdCached = "";
 
     public void setUserSpeakingListener(UserSpeakingListener listener) {
         this.userSpeakingListener = listener;
@@ -127,6 +138,7 @@ public final class AudioEngine implements AutoCloseable {
         }
         Thread t = new Thread(this::receiveLoop, "distrisync-audio-recv");
         t.setDaemon(true);
+        t.setPriority(Thread.MAX_PRIORITY);
         t.setUncaughtExceptionHandler((thread, ex) ->
                 log.error("Audio receive thread terminated", ex));
         receiveThread = t;
@@ -158,13 +170,13 @@ public final class AudioEngine implements AutoCloseable {
         }
 
         TargetDataLine line = AudioSystem.getTargetDataLine(AUDIO_FORMAT);
-        // 10 frames × 160 bytes — request minimal hardware buffer; OS may still use more.
-        line.open(AUDIO_FORMAT, 10 * PAYLOAD_SIZE);
+        line.open(AUDIO_FORMAT, LINE_BUFFER_BYTES);
         line.start();
         captureLine = line;
 
         Thread cap = new Thread(this::captureLoop, "distrisync-audio-capture");
         cap.setDaemon(true);
+        cap.setPriority(Thread.MAX_PRIORITY);
         captureThread = cap;
         cap.start();
     }
@@ -344,6 +356,7 @@ public final class AudioEngine implements AutoCloseable {
         Thread.currentThread().setPriority(Thread.MAX_PRIORITY);
 
         byte[] buf = new byte[UDP_PACKET_BYTES];
+        DatagramPacket pkt = new DatagramPacket(buf, buf.length);
 
         while (!closed.get()) {
             DatagramSocket sock;
@@ -360,7 +373,6 @@ public final class AudioEngine implements AutoCloseable {
             }
 
             try {
-                DatagramPacket pkt = new DatagramPacket(buf, buf.length);
                 sock.receive(pkt);
                 int len = pkt.getLength();
                 if (len < UDP_IDENTITY_BYTES + PAYLOAD_SIZE) {
@@ -369,7 +381,7 @@ public final class AudioEngine implements AutoCloseable {
 
                 byte[] pktBuf = pkt.getData();
                 int pktOff = pkt.getOffset();
-                String speakerId = decodeUtf8Identity36(pktBuf, pktOff);
+                String speakerId = decodeUtf8Identity36Cached(pktBuf, pktOff);
 
                 try {
                     ensurePlaybackOpen();
@@ -411,8 +423,7 @@ public final class AudioEngine implements AutoCloseable {
                 return;
             }
             SourceDataLine line = AudioSystem.getSourceDataLine(AUDIO_FORMAT);
-            // 10 frames × 160 bytes — starve the hardware queue so PCM cannot pile up.
-            line.open(AUDIO_FORMAT, 1600);
+            line.open(AUDIO_FORMAT, LINE_BUFFER_BYTES);
             line.start();
             playbackLine = line;
         }
@@ -432,6 +443,18 @@ public final class AudioEngine implements AutoCloseable {
         int n = Math.min(UDP_IDENTITY_BYTES, raw.length);
         System.arraycopy(raw, 0, out, 0, n);
         return out;
+    }
+
+    private String decodeUtf8Identity36Cached(byte[] buf, int identityOffset) {
+        if (rxSpeakerIdCacheValid
+                && Arrays.equals(buf, identityOffset, identityOffset + UDP_IDENTITY_BYTES,
+                rxIdentityMatch, 0, UDP_IDENTITY_BYTES)) {
+            return rxSpeakerIdCached;
+        }
+        System.arraycopy(buf, identityOffset, rxIdentityMatch, 0, UDP_IDENTITY_BYTES);
+        rxSpeakerIdCached = decodeUtf8Identity36(buf, identityOffset);
+        rxSpeakerIdCacheValid = true;
+        return rxSpeakerIdCached;
     }
 
     private static String decodeUtf8Identity36(byte[] buf, int identityOffset) {

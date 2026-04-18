@@ -19,6 +19,7 @@ import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
@@ -212,6 +213,31 @@ public final class UdpPointerTracker {
         });
 
         log.debug("UdpPointerTracker stopped");
+    }
+
+    /**
+     * Removes every remote peer cursor {@link Group} from the overlay and clears
+     * tracking state. Other {@code cursorPane} children (e.g. the local eraser
+     * preview square, transient text ghosts) are left intact.
+     *
+     * <p>When already on the FX thread the removal runs immediately; otherwise it
+     * is queued with {@link Platform#runLater}.
+     */
+    public void clearPeerCursors() {
+        Runnable r = () -> {
+            for (CursorEntry entry : new ArrayList<>(cursors.values())) {
+                if (entry.activeFade != null) {
+                    entry.activeFade.stop();
+                }
+                cursorPane.getChildren().remove(entry.node);
+            }
+            cursors.clear();
+        };
+        if (Platform.isFxApplicationThread()) {
+            r.run();
+        } else {
+            Platform.runLater(r);
+        }
     }
 
     // =========================================================================

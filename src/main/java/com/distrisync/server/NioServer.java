@@ -26,6 +26,7 @@ import java.nio.charset.CoderResult;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -103,6 +104,14 @@ public final class NioServer implements Runnable {
 
     /** Scratch for the 36-byte UDP token prefix; avoids per-datagram {@code byte[]} allocation. */
     private final byte[] udpTokenScratch = new byte[UDP_IDENTITY_BYTES];
+
+    /** Last token bytes matching {@link #udpCachedToken}; avoids {@code new String} on every relay frame. */
+    private final byte[] udpLastTokenScratch = new byte[UDP_IDENTITY_BYTES];
+    private boolean udpTokenStringCacheValid;
+    private String udpCachedToken = "";
+
+    /** Filled on the selector thread for {@link #writeClientIdPrefix36} — avoids {@link CharBuffer#wrap}. */
+    private final CharBuffer udpClientIdCharScratch = CharBuffer.allocate(256);
 
     /**
      * Reused on the selector thread to write the 36-byte client-id prefix without {@code String#getBytes}.
@@ -677,7 +686,7 @@ public final class NioServer implements Runnable {
         }
 
         udpBuffer.get(udpTokenScratch);
-        String token = new String(udpTokenScratch, StandardCharsets.UTF_8);
+        String token = resolveUdpTokenString();
 
         if (len == UDP_IDENTITY_BYTES) {
             ClientSession session = udpTokenToSession.get(token);
@@ -709,7 +718,7 @@ public final class NioServer implements Runnable {
         writeClientIdPrefix36(udpBuffer, speaker.clientId);
         udpBuffer.limit(len);
 
-        for (SelectionKey peerKey : room.getActiveKeys()) {
+        for (SelectionKey peerKey : room.activeKeysForSelectorIteration()) {
             if (!peerKey.isValid() || !(peerKey.attachment() instanceof ClientSession peer)) {
                 continue;
             }
@@ -734,10 +743,26 @@ public final class NioServer implements Runnable {
      * Writes exactly {@value #UDP_IDENTITY_BYTES} bytes of UTF-8 for {@code clientId}, zero-padded.
      * Uses {@link #udpClientIdEncoder} so the hot path does not allocate a {@code CharsetEncoder} or {@code byte[]}.
      */
+    private String resolveUdpTokenString() {
+        if (udpTokenStringCacheValid && Arrays.equals(udpTokenScratch, udpLastTokenScratch)) {
+            return udpCachedToken;
+        }
+        System.arraycopy(udpTokenScratch, 0, udpLastTokenScratch, 0, UDP_IDENTITY_BYTES);
+        udpCachedToken = new String(udpTokenScratch, StandardCharsets.UTF_8);
+        udpTokenStringCacheValid = true;
+        return udpCachedToken;
+    }
+
     private void writeClientIdPrefix36(ByteBuffer dst, String clientId) {
         int start = dst.position();
         int oldLimit = dst.limit();
-        CharBuffer in = CharBuffer.wrap(clientId != null ? clientId : "");
+        CharBuffer in = udpClientIdCharScratch;
+        in.clear();
+        String id = clientId != null ? clientId : "";
+        for (int i = 0, n = id.length(); i < n && in.hasRemaining(); i++) {
+            in.put(id.charAt(i));
+        }
+        in.flip();
         try {
             dst.limit(start + UDP_IDENTITY_BYTES);
             udpClientIdEncoder.reset();
@@ -873,7 +898,7 @@ public final class NioServer implements Runnable {
         List<SelectionKey> toClose = new ArrayList<>();
         int recipientCount = 0;
 
-        for (SelectionKey key : room.getActiveKeys()) {
+        for (SelectionKey key : room.activeKeysForSelectorIteration()) {
             if (!key.isValid()) {
                 continue;
             }
