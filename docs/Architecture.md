@@ -12,11 +12,12 @@
 2. [OSI Model Mapping](#2-osi-model-mapping)
 3. [Concurrency Model — NIO Selector Event Loop](#3-concurrency-model--nio-selector-event-loop)
 4. [State Management — CanvasStateManager](#4-state-management--canvasstatemanager)
-5. [Room Architecture — RoomManager & RoomContext](#5-room-architecture--roommanager--roomcontext)
+5. [Session Multiplexing — Rooms & Boards](#5-session-multiplexing--rooms--boards)
 6. [Write-Ahead Log — WalManager](#6-write-ahead-log--walmanager)
 7. [Pointer State Management — PointerStateManager](#7-pointer-state-management--pointerstate--pointerstate-manager)
-8. [Telemetry & Observability](#8-telemetry--observability)
-9. [Sequence Diagram — Two-Client Collaboration Flow](#9-sequence-diagram--two-client-collaboration-flow)
+8. [Dual-Protocol VoIP Audio Engine](#8-dual-protocol-voip-audio-engine)
+9. [Telemetry & Observability](#9-telemetry--observability)
+10. [Sequence Diagram — Two-Client Collaboration Flow](#10-sequence-diagram--two-client-collaboration-flow)
 
 ---
 
@@ -64,6 +65,9 @@ Every DistriSync message, regardless of direction or type, is wrapped in the sam
 | `0x09`    | `UNDO_REQUEST`     | Client → Server      | No               | Delete one shape by UUID. Payload: `{ "shapeId": "<uuid>" }`. Server responds with `SHAPE_DELETE`. |
 | `0x0A`    | `SHAPE_DELETE`     | Server → All peers   | **Yes**          | Server confirms deletion. Payload: `{ "shapeId": "<uuid>" }`. Broadcast to all peers except originator. |
 | `0x0B`    | `TEXT_UPDATE`      | Client → All peers   | No               | Ephemeral live-typing event. Payload: `{ objectId, clientId, authorName, x, y, currentText }`. Never written to `shapeMap`; final committed `TextNode` arrives as a `MUTATION`. |
+| `0x0F`    | `SWITCH_BOARD`     | Client → Server      | No               | Switches the active board within the current room workspace. Payload: `{ boardId }`. |
+| `0x10`    | `BOARD_LIST_UPDATE`| Server → Client      | No               | Announces room board-index changes for multi-board workspaces. Payload contains authoritative board metadata. |
+| `0x11`    | `UDP_ADMISSION`    | Server → Client      | No               | Grants access to the UDP audio data plane; payload contains `{ udpToken }`. |
 
 #### Shape Envelope Format (MUTATION / SNAPSHOT)
 
@@ -112,9 +116,11 @@ DistriSync operates across two layers of the OSI model. The lower layers (Physic
 │  • TCP_NODELAY enabled — small frames sent without Nagle delay  │
 │  • SO_SNDBUF / SO_RCVBUF set to 64 KiB to absorb burst traffic  │
 │                                                                 │
-│  UDP  (UdpPointerTracker — ephemeral cursor broadcasts only)    │
+│  UDP  (pointer + push-to-talk audio relay)                      │
 │  • Unreliable, unordered datagram delivery                      │
-│  • Wire code 0x04 (UDP_POINTER) — loss is intentionally OK     │
+│  • Wire code 0x04 (UDP_POINTER) — loss is intentionally OK      │
+│  • Push-to-talk relay uses 10 ms micro-frames and               │
+│    zero-allocation routing in the server hot path               │
 ├─────────────────────────────────────────────────────────────────┤
 │  Layers 1–3  (Physical / Data Link / Network)                   │
 │  OS kernel + hardware — transparent to application code         │
@@ -250,11 +256,11 @@ This removes all shapes attributed to one `clientId` in a single pass using `Con
 
 ---
 
-## 5. Room Architecture — RoomManager & RoomContext
+## 5. Session Multiplexing — Rooms & Boards
 
 ### 5.1 Overview
 
-Prior to this layer, all connected clients shared a single global `CanvasStateManager`. The room architecture partitions the server into isolated drawing sessions, each with independent canvas state and a scoped broadcast domain.
+Prior to this layer, all connected clients shared a single global `CanvasStateManager`. The session-multiplexing architecture partitions the server into isolated rooms and then partitions each room into independent board contexts.
 
 ```
 RoomManager
@@ -262,7 +268,8 @@ RoomManager
       │
       └── RoomContext (one per room)
             ├── roomId: String
-            ├── stateManager: CanvasStateManager   ← isolated canvas per room
+            ├── boards: ConcurrentHashMap<String, CanvasStateManager>
+            │     └── key: boardId → isolated board state
             └── activeKeys: Set<SelectionKey>       ← ConcurrentHashMap-backed
                   │
                   └── one SelectionKey per connected client in this room
@@ -272,14 +279,14 @@ RoomManager
 
 | Phase | What happens |
 |---|---|
-| **First join** | `RoomManager.getOrCreateRoom(roomId)` calls `rooms.computeIfAbsent`, which atomically creates a `RoomContext`. The `RoomContext` constructor immediately replays any persisted WAL records before returning. |
-| **Active** | Every `MUTATION`, `SHAPE_DELETE`, and `CLEAR_USER_SHAPES` is applied to the room's `CanvasStateManager`, appended to the room's WAL, then broadcast to all `SelectionKey`s in `RoomContext.activeKeys` except the sender. |
-| **Quiescent** | When the last client disconnects, `activeKeys` becomes empty. The `RoomContext` is **not** evicted — the `CanvasStateManager` retains canvas state so that rejoining clients receive a consistent `SNAPSHOT`. |
-| **Restart** | `RoomContext` is re-created on first join. The `WalManager.recover(roomId)` call replays the persisted log so the canvas is fully restored before any client connects. |
+| **First join** | `RoomManager.getOrCreateRoom(roomId)` calls `rooms.computeIfAbsent`, which atomically creates a `RoomContext`. Boards are lazily created with `boards.computeIfAbsent(boardId, ...)`, so unused boards incur zero allocation cost. |
+| **Active** | Every `MUTATION`, `SHAPE_DELETE`, and `CLEAR_USER_SHAPES` is applied only to the active board's `CanvasStateManager`, appended to that board's WAL partition, then broadcast to all `SelectionKey`s in `RoomContext.activeKeys` except the sender. |
+| **Quiescent** | When the last client disconnects, `activeKeys` becomes empty. The `RoomContext` remains resident, and each instantiated board manager retains state for fast reconnect snapshots. |
+| **Restart** | `RoomContext` is re-created on first join. Board state is recovered independently on demand through board-scoped WAL replay (`recover(roomId, boardId)`). |
 
 ### 5.3 Broadcast Scoping
 
-`NioServer` previously called a global `broadcastExcept(senderKey, frame)`. With rooms, broadcasts are scoped to `RoomContext.getActiveKeys()`:
+`NioServer` previously called a global `broadcastExcept(senderKey, frame)`. With room/board multiplexing, broadcasts are scoped to `RoomContext.getActiveKeys()` and semantically constrained to the sender's active board:
 
 ```
 for (SelectionKey key : room.getActiveKeys()) {
@@ -290,11 +297,11 @@ for (SelectionKey key : room.getActiveKeys()) {
 }
 ```
 
-A client in Room A will never receive a frame from Room B, even if both rooms are served by the same `NioServer` instance on the same port.
+A client in Room A will never receive a frame from Room B, even if both rooms are served by the same `NioServer` instance on the same port. Within one room, mutations and broadcasts are strictly board-scoped, preventing cross-board thread contention and eliminating accidental inter-board state leakage.
 
 ### 5.4 WAL Integration in RoomManager
 
-`RoomManager.appendToWal(roomId, message)` is a thin delegation wrapper:
+`RoomManager.appendToWal(roomId, boardId, message)` is a thin delegation wrapper:
 
 - If no `WalManager` was provided at construction (ephemeral mode), the call is a no-op.
 - `IOException` from the underlying `FileChannel` write is logged at `WARN` but not re-thrown — the mutation has already been applied in memory; dropping a single WAL record degrades durability without breaking the live session.
@@ -308,10 +315,10 @@ A client in Room A will never receive a frame from Room B, even if both rooms ar
 
 ```
 distrisync-data/
-  {sanitised-roomId}.wal    ← one APPEND-mode FileChannel per active room
+  {roomId}_{boardId}.wal    ← one APPEND-mode FileChannel per active room-board partition
 ```
 
-Room identifiers are sanitised before use as filenames: every character outside `[a-zA-Z0-9_\-]` is replaced by `_`. This prevents path-traversal attacks and ensures compatibility with all major filesystems.
+WALs are partitioned per board. This allows lazy, zero-overhead board creation: a board that has never received a durable mutation has no file, no open channel, and no recovery scan cost. It also enables independent state recovery, so one board's WAL lifecycle is isolated from every other board in the same room.
 
 ### 6.2 Frame Format
 
@@ -330,7 +337,7 @@ NioServer.processMessage()
     │
     ├─ CanvasStateManager.applyMutation()     ← update in-memory state
     │
-    ├─ RoomManager.appendToWal(roomId, msg)   ← persist to FileChannel (APPEND mode)
+    ├─ RoomManager.appendToWal(roomId, boardId, msg)   ← persist to FileChannel (APPEND mode)
     │       │
     │       └─ WalManager.append()
     │               └─ MessageCodec.encode() → ByteBuffer
@@ -340,7 +347,7 @@ NioServer.processMessage()
     └─ broadcastRoom(senderKey, frame)         ← fan-out to room peers
 ```
 
-`FileChannel` is opened lazily on the first `append` call per room and remains open until `WalManager.close()`. The `APPEND` open option guarantees that concurrent writes from a single thread are always positioned at the end of the file without requiring a separate `seek`.
+`FileChannel` is opened lazily on the first `append` call per `(roomId, boardId)` partition and remains open until `WalManager.close()`. The `APPEND` open option guarantees that concurrent writes from a single thread are always positioned at the end of the file without requiring a separate `seek`.
 
 **Durability trade-off:** writes are OS-buffered. The page cache will flush to stable storage within seconds under normal conditions. Operators requiring synchronous durability (at the cost of write throughput) can uncomment the `channel.force(false)` call in `WalManager.append`.
 
@@ -353,7 +360,7 @@ Server restart
             └─ new RoomContext(roomId, walManager)
                     └─ replayWal(walManager)
                             │
-                            ├─ WalManager.recover(roomId)
+                            ├─ WalManager.recover(roomId, boardId)
                             │       ├─ FileChannel.open(walPath, READ)
                             │       ├─ ByteBuffer.allocate(fileSize)  [single heap alloc]
                             │       └─ decode loop:
@@ -372,7 +379,7 @@ Server restart
 
 ### 6.5 Thread Safety
 
-`WalManager.channels` is a `ConcurrentHashMap<String, FileChannel>`. Channel creation is protected by `computeIfAbsent`. Individual `FileChannel.write` calls from the single-threaded NIO event loop are inherently serialised per file, so no additional lock is needed around write operations.
+`WalManager.channels` is a `ConcurrentHashMap<String, FileChannel>` keyed by room-board partition path. Channel creation is protected by `computeIfAbsent`. Individual `FileChannel.write` calls from the single-threaded NIO event loop are inherently serialised per file, so no additional lock is needed around write operations.
 
 ---
 
@@ -438,9 +445,54 @@ This eliminates `Thread.sleep` in pointer eviction tests, making the entire test
 
 ---
 
-## 8. Telemetry & Observability
+## 8. Dual-Protocol VoIP Audio Engine
 
-### 8.1 PING/PONG Round-Trip Time
+The VoIP subsystem uses a dual-protocol design: TCP serves as the authenticated control plane, while UDP serves as the low-latency audio data plane. This separation preserves deterministic session semantics without imposing TCP retransmission jitter on push-to-talk media.
+
+### 8.1 Token-Based Admission Model
+
+UDP is connectionless and therefore cannot, by itself, establish an authenticated session identity. Admission is anchored to the already-authenticated TCP control channel.
+
+1. Client completes `HANDSHAKE` over TCP.
+2. Server emits `UDP_ADMISSION` (`0x11`) with payload `{ udpToken }`.
+3. `udpToken` is a 36-byte cryptographic capability that the client must attach to UDP audio datagrams.
+4. UDP receive handlers validate token authenticity and session scope before relaying media payload bytes.
+
+This model prevents unauthenticated UDP injection while keeping the relay path constant-time after token validation.
+
+### 8.2 10 ms Micro-Framing
+
+Push-to-talk capture is framed at 10 ms cadence:
+
+- Sampling rate: 8 kHz
+- Encoding: 16-bit PCM
+- Samples per frame: 80
+- Payload bytes per frame: 160
+
+The wire datagram is fixed-length:
+
+```
+[udpToken: 36 bytes][pcmPayload: 160 bytes] = 196 bytes
+```
+
+Fixed-size framing eliminates variable-length parse branches and enables zero-allocation routing on the server hot path.
+
+### 8.3 NAT Hole Punching and Endpoint Learning
+
+Before audio relay begins, the client transmits a 36-byte UDP registration packet containing only `udpToken`. This packet serves two purposes:
+
+1. Opens/refreshes NAT mapping on the client side.
+2. Allows `NioServer` to learn the sender's effective public `InetSocketAddress` for outbound relaying.
+
+Once learned, that endpoint is used for peer audio fan-out within the same room/board scope. If NAT rebinding occurs, the client repeats registration to refresh the relay destination.
+
+[INSERT MERMAID SEQUENCE DIAGRAM FOR PUSH-TO-TALK HERE]
+
+---
+
+## 9. Telemetry & Observability
+
+### 9.1 PING/PONG Round-Trip Time
 
 After the `HANDSHAKE` exchange completes, `NetworkClient` starts a permanent daemon thread (`distrisync-ping`) that executes `heartbeatPingLoop()`:
 
@@ -492,7 +544,7 @@ Client                     NioServer
 
 ---
 
-### 8.2 Server-Side Traffic Metrics
+### 9.2 Server-Side Traffic Metrics
 
 `NioServer` maintains two lock-free in-process counters that are visible to any thread without external synchronisation:
 
@@ -522,7 +574,7 @@ log.info("[METRICS] Traffic routed: {} bytes | Active Rooms: {} | Active Sockets
 
 ---
 
-### 8.3 Telemetry HUD
+### 9.3 Telemetry HUD
 
 `WhiteboardApp.wireTelemetryHud(NetworkClient client)` constructs a non-interactive overlay anchored to the bottom-right corner of the canvas pane:
 
@@ -547,7 +599,7 @@ The HUD is positioned using `AnchorPane` constraints and carries no mouse event 
 
 ---
 
-## 9. Sequence Diagram — Two-Client Collaboration Flow
+## 10. Sequence Diagram — Two-Client Collaboration Flow
 
 The diagram below shows the complete lifecycle: two clients connecting, snapshot delivery with WAL recovery, Client 1 streaming a live draw gesture, a final committed `MUTATION` (persisted to WAL), and the server broadcasting all of these to Client 2.
 
